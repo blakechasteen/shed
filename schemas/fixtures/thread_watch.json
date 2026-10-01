@@ -1,0 +1,11 @@
+{
+  "polarity": "watch",
+  "id": "aaaa0006/1",
+  "text": "the worktree isolation hook refuses python heredocs even without git in them; use the Edit tool for multi-line edits in a worktree",
+  "tier": "interpreted",
+  "evidence": { "turn": "7c1d2e3f-0000-4000-8000-000000000007", "quote": "refuses python heredocs" },
+  "supersedes": { "id": "aaaa0005/3", "reason": "the earlier watch-out blamed git; the hook refuses the heredoc itself" },
+  "still_true": { "cmd": "grep -q heredoc .claude/hooks/worktree_isolation.py", "expect_rc": 0 },
+  "expires": "2026-12-01",
+  "scope": "repo"
+}

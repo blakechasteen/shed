@@ -1,0 +1,18 @@
+{
+  "statement": "S3 of shed_protocol_schemas: shed/schemas/ holds eight JSON Schemas with x-scope per field, fixtures the tests load, and shed.py's allowlist derived from the record schema",
+  "declared_at": "2026-09-25T18:02:11Z",
+  "sid8": "d5f3c0ae",
+  "done_when": {
+    "cmd": "test -d ../shed/schemas && test $(ls ../shed/schemas/*.json | wc -l) -ge 8",
+    "expect_rc": 0
+  },
+  "expires": "2026-10-09",
+  "scope": "repo",
+  "superseded": [
+    {
+      "statement": "read the schemas brief and scope S3",
+      "declared_at": "2026-09-25T17:55:00Z",
+      "reason": "scoping done; committing to the build"
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shed.thread",
+  "title": "thread — one prospective entry, open or watch",
+  "description": "A forward-intent entry in a shed record: an open thread (polarity `open`, lives in `open_threads`: something to pick up, with a next step) or a watch-out (polarity `watch`, lives in `watch_outs`: something to keep true, or to avoid). Prospective, so it carries a LEASE (lease.json rides flat here); the discharge test rides as `done_when` on an open thread and `still_true` on a watch-out — the shipping evaluators' names.\n\nEvery entry names who stands behind it (`tier`, required). `authored` needs nothing further. `derived` and `interpreted` must carry `evidence` — a verbatim quote and the transcript turn it came from — and finalize rejects the entry unless the quote is a substring of that turn: a proof-block gate applied to prose. A bare string is unknown-author and is rejected.\n\nCarry forward by copying, never by restating: an entry carried from an earlier archive names `origin_sid8` and must be byte-identical to an entry in that archive (`content_sha256`, S1, makes the check a hash). Identity is origin plus succession (S2): `id` = `<origin_sid8>/<ordinal>` assigned once, and `supersedes` points at the entry this one replaces, with the reason — one semantic shared with intent.superseded, the brief lifecycle and LBP-Wire §10, in one costume.\n\nA brief is not a noun here: it is a thread that escaped into its own file to be suggested to a stranger. At level zero, threads suffice.",
+  "type": "object",
+  "required": ["tier"],
+  "anyOf": [
+    { "required": ["thread"] },
+    { "required": ["text"] }
+  ],
+  "allOf": [
+    { "$ref": "lease.json" }
+  ],
+  "properties": {
+    "polarity": {
+      "type": "string",
+      "enum": ["open", "watch"],
+      "description": "Which kind of thread. Implied by the record field the entry sits in (`open_threads` → open, `watch_outs` → watch); stated only when the entry travels alone (a room event, a fixture)."
+    },
+    "thread": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Open polarity: the unresolved item, named."
+    },
+    "next_step": {
+      "type": "string",
+      "description": "Open polarity: the concrete next action."
+    },
+    "blockers": {
+      "type": "string",
+      "description": "Open polarity: what is in the way, if anything. A non-empty value does NOT imply a failed status."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["blocked", "abandoned", "refused", "failed"],
+      "description": "Open polarity, optional: marks a genuinely FAILED thread. Absence = a normal open thread."
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Watch polarity: the warning, in one or two sentences."
+    },
+    "gloss": {
+      "type": "string",
+      "description": "Free prose about the entry — the paraphrase, the why, the model's reading. NEVER gated, always rendered as the entry's tier. The claim lives in `thread` / `text` and must be a verbatim span of the cited turn; anything the writer wants to add in its own words goes here, where a reader can see it is not a quotation."
+    },
+    "tier": { "$ref": "tier.json" },
+    "evidence": {
+      "type": "object",
+      "required": ["turn"],
+      "description": "Required on derived / interpreted entries. `turn` is a transcript turn index or uuid; the entry's CLAIM TEXT (`thread` on an open thread, `text` on a watch-out) must be a verbatim substring of that turn's text, or finalize rejects it. `quote` is optional and, when present, must be a substring too; it is no longer what the gate is about — an attached quote bound nothing (a fabricated thread beside a real, unrelated quote passed the earlier gate). Basis at entry granularity: the instrument is the transcript, the substring test is the reproduction.",
+      "properties": {
+        "turn": { "type": ["integer", "string"] },
+        "quote": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "intent_verdict": {
+      "type": "string",
+      "enum": ["UNMET", "UNARMED", "ERROR"],
+      "description": "Set when the entry was written by finalize from the session's declared intent (`declare`): the statement, verbatim and authored, carrying its own done_when. MET never becomes a thread — it becomes a progress line."
+    },
+    "origin_sid8": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8,
+      "description": "Set when the entry is carried from an earlier archive: the sid8 of that archive. The entry must then be byte-identical (minus this key and content_sha256) to an entry in it."
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "S1: sha256 of the source entry's canonical JSON (sorted keys, no insignificant whitespace, minus `origin_sid8` and `content_sha256`). Beside `origin_sid8` this makes the carry check a hash rather than a byte-compare, and is the `tension_target` a later disposition binds to."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[^/]{1,8}/[0-9]+$",
+      "description": "S2: `<origin_sid8>/<ordinal>` — assigned when the entry is first written, kept verbatim when carried. Identity = origin; succession is `supersedes`."
+    },
+    "supersedes": {
+      "type": "object",
+      "required": ["id"],
+      "description": "S2: the entry this one replaces, and why. A restated thread is a NEW entry that supersedes the old one — never an edit of the carried copy.",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[^/]{1,8}/[0-9]+$" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "done_when": { "$ref": "discharge.json" },
+    "still_true": { "$ref": "discharge.json" },
+    "expires": { "$ref": "lease.json#/properties/expires" },
+    "scope": { "$ref": "lease.json#/properties/scope" }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shed.discharge",
+  "title": "discharge — the one test atom",
+  "description": "One shell predicate whose exit status settles a claim. This is the single atom under every forward-intent artifact in the protocol: it appears as `done_when` (an intent, an open thread, a capkip arm, a brief), as `still_true` (a watch-out), as the `cmd` + `evidence` of a proof block, and as the evidence gate that finalize applies to model prose. One schema, referenced everywhere; the carrier adds the horizon (see lease.json).\n\nPolarity: the predicate HOLDING means the claim is discharged — the intent was MET, the thread LANDED, the watch-out is STILL TRUE. `expect_absent` inverts that reading for the runner, so 'the file is gone' can be stated without a shell negation. A run that cannot execute (rc 124 timeout, 126/127 unrunnable, git's fatal 128) is ERROR: instrument silent, never a verdict — the same rule as basis.json's BLIND.\n\nThe shipping evaluator is hololoom_mcp/tools/watchout_tripwires.py (`validate` / `evaluate`), shared by intent_tripwires.py; this file transcribes its accepted keys and adds none. A discharge test moves an artifact across tenses: a prospective claim with a discharge that ran is a settled one.",
+  "type": "object",
+  "required": ["cmd"],
+  "properties": {
+    "cmd": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Exact re-runnable shell command. Paths are relative to the carrier's `scope` (repo root for `repo`). Anchor pathspecs (`:/…`) — a cwd-relative path that matches nothing exits 0 empty and reads as success."
+    },
+    "expect_rc": {
+      "type": "integer",
+      "default": 0,
+      "description": "Exit status that means the predicate holds. Default 0."
+    },
+    "expect_re": {
+      "type": "string",
+      "description": "Optional regex the command's stdout must also match for the predicate to hold. Python `re.search` semantics."
+    },
+    "expect_absent": {
+      "type": "boolean",
+      "default": false,
+      "description": "true = the runner INVERTS the result: the claim holds when the command does NOT match. Lets 'X is gone' be stated as `test -f X` + expect_absent instead of a shell negation whose own failure modes read as success."
+    }
+  },
+  "additionalProperties": false
+}

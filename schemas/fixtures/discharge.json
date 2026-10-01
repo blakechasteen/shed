@@ -1,0 +1,6 @@
+{
+  "cmd": "test -f handoff/brief/shed_protocol_schemas.md",
+  "expect_rc": 0,
+  "expect_re": "",
+  "expect_absent": false
+}

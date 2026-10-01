@@ -1,0 +1,15 @@
+{
+  "polarity": "open",
+  "id": "aaaa0005/1",
+  "thread": "timezone bug in the cron matcher",
+  "gloss": "tz bug — the monday flake",
+  "next_step": "fix cron matcher",
+  "blockers": "",
+  "tier": "interpreted",
+  "evidence": { "turn": 1 },
+  "origin_sid8": "aaaa0005",
+  "content_sha256": "4c41e60f2b7a9d1e8f3c5b6a7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e",
+  "done_when": { "cmd": "grep -q 'tz=UTC' cron_matcher.py", "expect_rc": 0 },
+  "expires": "2026-11-01",
+  "scope": "repo"
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shed.lease",
+  "title": "lease — rider on every prospective artifact",
+  "description": "NOT a standalone artifact: these keys ride flat on a prospective (future-tense) artifact — an intent, an open thread, a watch-out, a capkip arm — and bound how long it may claim attention. Settled (past-tense) artifacts carry provenance instead (tier, basis, later a signature) and never a lease.\n\nThe protocol's 'suggest, never direct' becomes checkable here: a directive is a prospective artifact with no lease. Decay is leases expiring by silence; cooling-off is a lease on a settled artifact before it bears load; the sweep evaluates leases; the open-brief count is the outstanding lease book. Economically, a firm holds unbounded claims on attention; this protocol permits only leased ones.\n\nThe lease's discharge test (discharge.json) rides under the CARRIER'S OWN KEY, not under a `discharge` key — `done_when` on an intent, an open thread and a capkip arm; `still_true` on a watch-out — because those are the names the shipping evaluators read and compatibility with what hololoom_mcp already reads outweighs shape purity until signing lands. `expires` and `scope` are REQUIRED beside any discharge test (a predicate with no dated backstop can never auto-close). An artifact with neither `expires` nor a discharge is unleased: in shed that means it lives until the next handoff, which carries it forward by byte-identical copy or lets it drop.",
+  "x-embedded": true,
+  "type": "object",
+  "properties": {
+    "expires": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "Dated backstop, YYYY-MM-DD (UTC). After this date the artifact auto-declines by silence; the decay vent is attention-demotion, not deletion, and 'expired' never means 'judged'."
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["repo", "host"],
+      "description": "Who may run the discharge test. `repo` = checkout-only, CI can run it. `host` = reads state on the machine that wrote the artifact (a launchd list, a socket, a local file outside the repo); a clone must report ERROR, never a verdict."
+    }
+  }
+}

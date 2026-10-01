@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shed.decision",
+  "title": "decision — one settled entry",
+  "description": "A choice made during the session, worth carrying forward. SETTLED (past tense): it carries provenance — `tier`, and `evidence` unless authored — and never a lease; a decision does not expire, it gets superseded. Same grounding rule as thread.json: `derived` and `interpreted` entries must quote the transcript turn they came from and finalize rejects a quote that is not a substring of it. Same carry rule: `origin_sid8` + byte-identity (S1: `content_sha256`); same identity rule (S2: `id`, `supersedes`).\n\nThe fixture and the field set are shed's — `text` is the decision. hololoom_mcp's /handoff skill writes decisions as bare strings; shed rejects those at finalize because a string cannot say who stands behind it.",
+  "type": "object",
+  "required": ["text", "tier"],
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The decision, in one or two sentences, readable outside the session."
+    },
+    "gloss": {
+      "type": "string",
+      "description": "Free prose about the decision — never gated, always rendered as the entry's tier. `text` must be a verbatim span of the cited turn; the writer's own words go here."
+    },
+    "tier": { "$ref": "tier.json" },
+    "evidence": {
+      "type": "object",
+      "required": ["turn"],
+      "description": "Required on derived / interpreted entries: the transcript turn (index or uuid). `text` must be a verbatim substring of that turn; `quote` is optional and, when present, must be a substring too.",
+      "properties": {
+        "turn": { "type": ["integer", "string"] },
+        "quote": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "origin_sid8": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8,
+      "description": "Set when carried from an earlier archive; the entry must be byte-identical to one there."
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "S1: sha256 of the source entry's canonical JSON minus `origin_sid8` / `content_sha256`."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[^/]{1,8}/[0-9]+$",
+      "description": "S2: `<origin_sid8>/<ordinal>`, assigned once."
+    },
+    "supersedes": {
+      "type": "object",
+      "required": ["id"],
+      "description": "S2: the decision this one reverses or refines, and why.",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[^/]{1,8}/[0-9]+$" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

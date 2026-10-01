@@ -1,0 +1,58 @@
+{
+  "sid8": "aaaa0005",
+  "source": "shed",
+  "draft": false,
+  "started_at": "2026-09-23T20:00:00Z",
+  "ended_at": "2026-09-23T20:41:12Z",
+  "intent": {
+    "statement": "retag the release and leave the monday CI flake open with its cause named",
+    "declared_at": "2026-09-23T20:00:30Z",
+    "sid8": "aaaa0005",
+    "done_when": { "cmd": "git tag --list v1.1 | grep -q v1.1", "expect_rc": 0 },
+    "expires": "2026-10-07",
+    "scope": "repo"
+  },
+  "tldr": "Retagged v1.1.",
+  "summary": "Mechanical draft by shed: topic = first user turn, human_first/human_last = the human's own first and last sentences verbatim (never regenerated), tldr = last assistant turn, progress = commits since start. open_threads / watch_outs / decisions need a human or a model to fill; empty here is 'unknown', not 'none'.",
+  "turns": 2,
+  "progress": [
+    "3f9c2a1 retag v1.1"
+  ],
+  "open_threads": [
+    {
+      "id": "aaaa0005/1",
+      "thread": "tz bug",
+      "next_step": "fix cron matcher",
+      "tier": "interpreted",
+      "evidence": { "turn": 1, "quote": "timezone bug in the cron matcher" },
+      "done_when": { "cmd": "grep -q 'tz=UTC' cron_matcher.py", "expect_rc": 0 },
+      "expires": "2026-11-01",
+      "scope": "repo"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "aaaa0005/2",
+      "text": "leave the flake open",
+      "tier": "interpreted",
+      "evidence": { "turn": 1, "quote": "left it open" }
+    }
+  ],
+  "watch_outs": [
+    {
+      "text": "CI flaky on mondays",
+      "tier": "authored"
+    }
+  ],
+  "files_touched": [
+    "cron_matcher.py"
+  ],
+  "first_commit_seconds": 611,
+  "extractiveness": 0.833,
+  "basis": [
+    { "instrument": "transcript", "state": "read", "observed_at": "2026-09-23T20:41:12Z" },
+    { "instrument": "git", "state": "read", "observed_at": "2026-09-23T20:41:12Z" }
+  ],
+  "shared_fields": [],
+  "private_sha256": "9a5d3f0c1b2e4d6f8a7c9b0e1d2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f"
+}

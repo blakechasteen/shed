@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shed.record",
+  "title": "record — one session's handoff",
+  "description": "The session record shed drafts on every Stop and finalizes at SessionEnd. SETTLED once finalized (`draft: false`, `ended_at` set): immutable, provenance-carrying, the cross-session record. Its prospective parts — `open_threads`, `watch_outs`, an `intent` — are leased artifacts nested inside it (thread.json, intent.json); the record itself never expires.\n\nEVERY FIELD DECLARES ITS EMISSION SCOPE — `x-scope: shared | private`. This annotation IS the private layer's allowlist: shed.py derives FIELD_SCOPE from this file at import and `split_record` projects the draft into the shared archive (`handoff/sessions/<ended>__<sid8>.json`, committed, mirrored) and the private record (`handoff/private/<sid8>.json`, gitignored, this machine only). Anything a person SAID is private: `human_first`, `human_last`, `session_topic` (a whitespace-normalized copy of her first sentence — the same words) and the transcript pointer. A key not declared here reaches neither file. `--share <field>` on finalize is the contracted emission that lets one private field into one shared record, and `shared_fields` records that it happened. The record never crosses the git boundary by replication, only by a scope this schema declares (project_contracted_emission_invariant, at field granularity).\n\nEvery field also declares who stands behind it — `x-tier`, tier.json's enum: the human's sentences are `authored`; what shed computes from git and the transcript is `derived` and carries a `basis` reading per instrument (basis.json) so a missing transcript is BLIND, never 'zero turns'; `tldr` and the gated lists are `interpreted` unless an entry says otherwise. Record-level tier is stated in the schema rather than repeated on every record because it is a property of the writer, not of the instance.\n\nThe archive shape is the one hololoom_mcp already reads (its /handoff skill writes a superset — `summary`, `active_threads`, `capkip`, `briefs` — and shed stands down when such an archive exists for the session). This schema is shed's contract: what shed writes, every key declared. Readers stay lenient; the writer is strict.",
+  "type": "object",
+  "required": ["sid8", "source", "draft", "started_at", "ended_at", "progress", "open_threads", "decisions", "watch_outs", "files_touched"],
+  "properties": {
+    "sid8": {
+      "type": "string", "minLength": 1, "maxLength": 8, "x-scope": "shared", "x-tier": "derived",
+      "description": "First 8 of the session id (CLAUDE_CODE_SESSION_ID); `nosid` when none was available. Identity of the record is the filename stem `<ended>__<sid8>`, never the sid8 alone — a sid8 spans several archives when a session resumes."
+    },
+    "source": {
+      "type": "string", "x-scope": "shared", "x-tier": "derived",
+      "description": "Which writer produced the record: `shed` here. finalize stands down when a non-shed archive for the sid8 already exists — the richer record always wins; shed is the backstop."
+    },
+    "draft": {
+      "type": "boolean", "x-scope": "shared", "x-tier": "derived",
+      "description": "true while the record is the Stop hook's live draft under handoff/drafts/; false once finalized."
+    },
+    "started_at": {
+      "type": "string", "x-scope": "shared", "x-tier": "derived",
+      "description": "ISO 8601 UTC. The transcript's first timestamp, or the first draft's time; kept across refreshes."
+    },
+    "ended_at": {
+      "type": ["string", "null"], "x-scope": "shared", "x-tier": "derived",
+      "description": "ISO 8601 UTC at finalize; null on a draft."
+    },
+    "intent": {
+      "$ref": "intent.json", "x-scope": "shared", "x-tier": "authored",
+      "description": "What the session declared before it touched files, copied verbatim from the live scratchpad. Absent when nothing was declared (ABSENT = no probe, not no intent)."
+    },
+    "tldr": {
+      "type": "string", "x-scope": "shared", "x-tier": "interpreted",
+      "description": "One sentence readable outside the project. Mechanically the first sentence of the last assistant turn — model prose even when clipped, so interpreted. The extractiveness number is computed over it."
+    },
+    "summary": {
+      "type": "string", "x-scope": "shared", "x-tier": "derived",
+      "description": "Shed's own statement of how the record was made and what each field means — a fixed text, so a reader of the bare file knows `empty` means unknown, not none."
+    },
+    "turns": {
+      "type": "integer", "x-scope": "shared", "x-tier": "derived",
+      "description": "Text turns read from the transcript. 0 with basis[transcript].state = BLIND means the transcript could not be read, not that nothing was said."
+    },
+    "progress": {
+      "type": "array", "items": { "type": "string" }, "x-scope": "shared", "x-tier": "derived",
+      "description": "Commit subjects since `started_at` (`git log --format='%h %s'`), oldest last as git prints them. Derived from git; basis[git] says whether git could be read."
+    },
+    "open_threads": {
+      "type": "array", "items": { "$ref": "thread.json" }, "x-scope": "shared", "x-tier": "interpreted",
+      "description": "Polarity `open`. Empty means unknown, not none. Filled by a human or a model; every entry passes the evidence gate at finalize."
+    },
+    "decisions": {
+      "type": "array", "items": { "$ref": "decision.json" }, "x-scope": "shared", "x-tier": "interpreted",
+      "description": "Settled choices worth carrying. Same gate."
+    },
+    "watch_outs": {
+      "type": "array", "items": { "$ref": "thread.json" }, "x-scope": "shared", "x-tier": "interpreted",
+      "description": "Polarity `watch`. Same gate."
+    },
+    "files_touched": {
+      "type": "array", "items": { "type": "string" }, "x-scope": "shared", "x-tier": "derived",
+      "description": "Union of paths in commits since `started_at` and paths dirty at draft time, sorted. Paths only — a filename is a pointer, never content."
+    },
+    "first_commit_seconds": {
+      "type": ["integer", "null"], "x-scope": "shared", "x-tier": "derived",
+      "description": "Seconds from `started_at` to the session's first commit; null when there was none. One of the arc's two coordination-cost numbers (the other is est_tokens to orient, in metrics.jsonl)."
+    },
+    "extractiveness": {
+      "type": ["number", "null"], "x-scope": "shared", "x-tier": "derived",
+      "description": "Share of the record's interpreted word 3-grams found in the transcript turns and commit subjects, 0.0–1.0; null when there was too little interpreted text. Falling across sessions is the drift alarm. Written at finalize only."
+    },
+    "basis": {
+      "type": "array", "items": { "$ref": "basis.json" }, "x-scope": "shared", "x-tier": "derived",
+      "description": "One reading per instrument shed drafted from — `transcript` and `git`. The rider that keeps `turns: 0` and `progress: []` from being read as silence when the instrument was BLIND."
+    },
+    "shared_fields": {
+      "type": "array", "items": { "type": "string" }, "x-scope": "shared", "x-tier": "derived",
+      "description": "Private fields that crossed into THIS shared record by `--share`, sorted. Empty on the hook path, which never shares. The record of a contracted emission, on the record."
+    },
+    "private_sha256": {
+      "type": "string", "pattern": "^[0-9a-f]{64}$", "x-scope": "shared", "x-tier": "derived",
+      "description": "Commit-and-reveal: sha256 of the private record's canonical JSON (the private fields only, sorted keys), carried on the shared file next to nothing else from them. `shed.py verify <archive>` checks this machine's private record against it, and a `--share`d sentence is checkable by anyone holding the shared file. The git boundary is the seal; this is the journal at level zero."
+    },
+    "session_topic": {
+      "type": "string", "x-scope": "private", "x-tier": "authored",
+      "description": "First user turn, first sentence, whitespace-normalized, capped. PRIVATE: it is her sentence in other whitespace, and a shared topic that is her sentence is the leak the layer exists to close."
+    },
+    "human_first": {
+      "type": "string", "x-scope": "private", "x-tier": "authored",
+      "description": "The human's first sentence, byte-for-byte, never regenerated. PRIVATE by default; orient reads it back on the machine that recorded it and prints it before tldr, so her words frame the synthesis and not the reverse."
+    },
+    "human_last": {
+      "type": "string", "x-scope": "private", "x-tier": "authored",
+      "description": "The human's last sentence, byte-for-byte. PRIVATE. `--share human_last` is the worked example of a contracted emission."
+    },
+    "transcript_path": {
+      "type": ["string", "null"], "x-scope": "private", "x-tier": "derived",
+      "description": "Where the transcript was read from. PRIVATE: a pointer into ~/.claude/projects is a pointer to every word of the session."
+    }
+  }
+}

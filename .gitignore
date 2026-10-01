@@ -1,0 +1,3 @@
+__pycache__/
+# shed run inside its own checkout: per-machine state never commits
+handoff/
