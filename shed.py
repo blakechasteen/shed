@@ -24,7 +24,9 @@ This slice ships three of them:
 
   draft     the draft seat (optional): a local model proposes open_threads /
             decisions / watch_outs; only entries the evidence gate passes are
-            written. The gate judges, the model is the variable.
+            written. The gate judges, the model is the variable. An optional
+            typed judge (SHED_JUDGE: Kev / Mica) may then drop kept entries
+            that are status narration — drop only, never add; silence keeps.
 
 Both are wired into Claude Code as hooks so no prompt has to ask for them:
 SessionStart runs orient and injects the page; Stop refreshes the draft;
@@ -43,6 +45,7 @@ usage:
                   [--expect-absent] --expires YYYY-MM-DD [--scope repo|host]] [--reason WHY]
   shed.py handoff [--root DIR] [--transcript FILE] [--sid8 X] [--finalize] [--share FIELD]...
   shed.py draft   [--root DIR] [--transcript FILE] [--sid8 X] [--model NAME[@URL]] [--budget CHARS] [--timeout S]
+                  [--judge NAME[@URL][,...]] [--judge-tau P] [--judge-budget S]
   shed.py verify  <shared archive> [--root DIR]
   shed.py check   SCHEMA FILE                          # form only, against schemas/<SCHEMA>.json
   shed.py install [--root DIR]
@@ -61,6 +64,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 MAX_LINES_DEFAULT = 40
@@ -1155,6 +1159,98 @@ def seat_entries(obj):
     return out
 
 
+# ---------------------------------------------------------------- relevance judge (optional, after the gate)
+#
+# The gate checks grounding, not relevance: a model that copies the assistant's own status chatter
+# ("The server is up. Now the real run…") passes it. A typed judge — one prefill, a softmax over
+# option labels, no decode (Kev / Mica on TypeSafe's System One wire) — reads each kept entry and
+# says whether it is anything a later session needs. It may only DROP a seat-written entry, which
+# moves the record back toward empty, the baseline with no seat at all; it never adds, rewrites,
+# or touches an authored or carried entry. Every failure keeps the entry.
+
+JUDGE_ENDPOINT = "http://127.0.0.1:18008"  # Kev's serve port here; Mica is conventionally :18010
+JUDGE_TAU = 0.8       # drop only at this averaged narration probability or above. First Mica smoke
+                      # (2026-10-01): real handoff entries topped out at 0.72, so 0.8 leaves margin
+                      # while still dropping about half of real status narration
+JUDGE_BUDGET = 6.0    # seconds for all judge calls; seat (20) + judge (6) stay inside SessionEnd's 30
+JUDGE_STATE_CAP = 1200  # chars of claim text sent; the judges were trained on short states
+JUDGE_QUESTION = ("This line was copied from a coding session's transcript to hand to the NEXT session, "
+                  "which starts cold. What kind of line is it?")
+JUDGE_OPTIONS = {
+    "forward": "Unfinished work, or something promised or planned for later",
+    "settled": "A decision or ruling the next session should keep to",
+    "hazard": "A warning, gotcha, failure, or constraint worth knowing",
+    "narration": "In-the-moment status chatter or an offer to the user (\"Now running X\", "
+                 "\"Want me to…?\"); nothing a later session needs",
+}
+
+
+def judge_specs(spec):
+    """`NAME[@URL][,NAME[@URL]...]` -> [(name, base url)]. Several judges are averaged."""
+    out = []
+    for part in (spec or "").split(","):
+        name, _, url = part.strip().partition("@")
+        if name.strip():
+            out.append((name.strip(), (url.strip() or JUDGE_ENDPOINT).rstrip("/")))
+    return out
+
+
+def ask_judge(url, model, state, timeout):
+    """One System One choice question. Returns ({option: prob}, None) or (None, why)."""
+    import urllib.request
+    import urllib.error
+    body = json.dumps({"model": model, "state": state,
+                       "questions": {"q": {"type": "choice", "instructions": JUDGE_QUESTION,
+                                           "criteria": JUDGE_OPTIONS}}}).encode("utf-8")
+    req = urllib.request.Request(url + "/v1/systemone", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            env = json.loads(r.read().decode("utf-8"))
+        probs = env["answers"]["q"]["probabilities"]
+        p = {k: float(probs[k]) for k in JUDGE_OPTIONS}
+    except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return None, "judge {}: {}".format(model, e)
+    total = sum(p.values())
+    if total <= 0:
+        return None, "judge {}: no probability mass on the options".format(model)
+    return {k: v / total for k, v in p.items()}, None
+
+
+def judge_kept(kept, judges, tau=JUDGE_TAU, budget=JUDGE_BUDGET, clock=time.monotonic):
+    """Drop seat entries every judge answered on and whose averaged narration probability is >= tau.
+    Returns (kept, stats). An entry a judge could not answer on, or one the budget ran out
+    before, stays — silence is never a verdict."""
+    deadline = clock() + budget
+    stats = {"judged": 0, "dropped": 0, "unjudged": 0, "judge_silent": 0, "rows": []}
+    out = {f: [] for f in kept}
+    for field, entries in kept.items():
+        for e in entries:
+            state = (_claim_text(e) or "")[:JUDGE_STATE_CAP]
+            answers = []
+            for name, url in judges:
+                left = deadline - clock()
+                if left <= 0:
+                    break
+                p, _why = ask_judge(url, name, state, min(left, 5.0))
+                if p is None:
+                    break
+                answers.append(p)
+            if len(answers) < len(judges):
+                stats["unjudged" if deadline - clock() <= 0 else "judge_silent"] += 1
+                out[field].append(e)
+                continue
+            avg = {k: sum(a[k] for a in answers) / len(answers) for k in JUDGE_OPTIONS}
+            choice = max(avg, key=avg.get)
+            drop = choice == "narration" and avg["narration"] >= tau
+            stats["judged"] += 1
+            stats["dropped"] += int(drop)
+            stats["rows"].append({"field": field, "choice": choice, "p_narration": round(avg["narration"], 3),
+                                  "dropped": drop})
+            if not drop:
+                out[field].append(e)
+    return out, stats
+
+
 def cmd_draft(args, payload=None):
     """`shed.py draft`: fill the mechanical draft's three empty lists from a local model, keeping
     only what the evidence gate passes. Always exits 0 — the seat is optional, the record is not:
@@ -1209,6 +1305,12 @@ def cmd_draft(args, payload=None):
             seen.add(claim)
             kept[field].append(e)
 
+    judges = judge_specs(getattr(args, "judge", None) or os.environ.get("SHED_JUDGE"))
+    jstats = None
+    if judges:
+        kept, jstats = judge_kept(kept, judges, getattr(args, "judge_tau", JUDGE_TAU),
+                                  getattr(args, "judge_budget", JUDGE_BUDGET))
+
     # Replace the model's lists (depth one from primary: the seat reads the transcript, never the
     # last seat's prose); what a person wrote and what was carried from an earlier archive stay.
     for field in GATED_FIELDS:
@@ -1217,8 +1319,17 @@ def cmd_draft(args, payload=None):
         rec[field] = standing + kept[field]
     write_json(draft_path, rec)
     n_kept = sum(len(v) for v in kept.values())
-    metric(root, "draft_seat", sid8=sid8, model=model, proposed=proposed, kept=n_kept, rejected=rejected)
+    extra = {}
+    if jstats is not None:
+        # `kept` stays the gate's count (what the seat could ground); `dropped` is the judge's cut.
+        n_kept += jstats["dropped"]
+        extra = dict(judge=[n for n, _ in judges], **jstats)
+    metric(root, "draft_seat", sid8=sid8, model=model, proposed=proposed, kept=n_kept, rejected=rejected, **extra)
     print("draft seat: {} proposed, {} kept, {} rejected ({})".format(proposed, n_kept, rejected, model))
+    if jstats is not None:
+        print("relevance judge ({}): {} judged, {} dropped as narration, {} unjudged, {} silent".format(
+            "+".join(n for n, _ in judges), jstats["judged"], jstats["dropped"], jstats["unjudged"],
+            jstats["judge_silent"]))
     for r in reasons:
         print("  - " + r)
     return 0
@@ -1228,7 +1339,13 @@ def run_seat(args, payload=None):
     """The hook's way in: SHED_MODEL names the model, SHED_MODEL_TIMEOUT bounds it, and nothing
     the seat does — including raising — can fail the handoff it runs inside."""
     args.model = None
+    args.judge = None  # SHED_JUDGE, read in cmd_draft
     args.budget = SEAT_BUDGET
+    args.judge_tau = JUDGE_TAU
+    try:
+        args.judge_budget = float(os.environ.get("SHED_JUDGE_BUDGET") or JUDGE_BUDGET)
+    except ValueError:
+        args.judge_budget = JUDGE_BUDGET
     try:
         args.timeout = float(os.environ.get("SHED_MODEL_TIMEOUT") or SEAT_TIMEOUT)
     except ValueError:
@@ -1419,6 +1536,10 @@ def main(argv=None):
                                    "URL default $SHED_ENDPOINT or " + SEAT_ENDPOINT + ")")
     s.add_argument("--budget", type=int, default=SEAT_BUDGET, help="transcript chars sent, from the end")
     s.add_argument("--timeout", type=float, default=SEAT_TIMEOUT)
+    s.add_argument("--judge", help="NAME[@URL][,NAME[@URL]] System One judge(s) that may drop narration the gate "
+                   "kept; several are averaged (default: $SHED_JUDGE; URL default {})".format(JUDGE_ENDPOINT))
+    s.add_argument("--judge-tau", type=float, default=JUDGE_TAU)
+    s.add_argument("--judge-budget", type=float, default=JUDGE_BUDGET, help="seconds for all judge calls")
     s.set_defaults(fn=cmd_draft)
 
     v = sub.add_parser("verify", help="check this machine's private record against a shared archive's commitment")

@@ -587,14 +587,31 @@ import socket
 import threading
 
 SEAT = {"reply": "", "requests": []}
+# System One judge: probabilities keyed by (model, substring of state); first match wins, else forward.
+JUDGE = {"rules": [], "requests": []}
+
+
+def judge_reply(body):
+    state, model = body.get("state") or "", body.get("model")
+    probs = {"forward": 0.7, "settled": 0.1, "hazard": 0.1, "narration": 0.1}
+    for m, needle, p in JUDGE["rules"]:
+        if m in (None, model) and needle in state:
+            probs = p
+            break
+    return {"model": model, "answers": {"q": {"type": "choice", "probabilities": probs,
+                                              "choice": max(probs, key=probs.get)}}}
 
 
 class FakeSeat(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-        SEAT["requests"].append({"path": self.path, "body": body})
-        out = json.dumps({"choices": [{"message": {"role": "assistant", "content": SEAT["reply"]},
-                                       "finish_reason": "stop"}]}).encode()
+        if self.path == "/v1/systemone":
+            JUDGE["requests"].append(body)
+            out = json.dumps(judge_reply(body)).encode()
+        else:
+            SEAT["requests"].append({"path": self.path, "body": body})
+            out = json.dumps({"choices": [{"message": {"role": "assistant", "content": SEAT["reply"]},
+                                           "finish_reason": "stop"}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
@@ -745,6 +762,110 @@ with tempfile.TemporaryDirectory() as tmp:
     r = hook("session-end", "seat0005", {"SHED_MODEL": SPEC})
     check("draft seat: stand-down comes before the seat — no model call for a record shed will not write",
           r.returncode == 0 and "stood down" in r.stdout and len(SEAT["requests"]) == n_req, r.stdout + r.stderr)
+
+# ---------------------------------------------------------------- relevance judge (fake System One, same server)
+JBASE = "http://127.0.0.1:{}".format(srv.server_address[1])
+NARR = {"forward": 0.05, "settled": 0.05, "hazard": 0.05, "narration": 0.85}
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    t = os.path.join(tmp, "t.jsonl")
+    with open(t, "w") as f:
+        for role, text in (("user", "wire the exporter"),
+                           ("assistant", "The server is up. Now the real run. The exporter still drops the header row; that is next."),
+                           ("user", "fine"),
+                           ("assistant", "Want me to go ahead? Careful: the export dir is shared with CI.")):
+            content = text if role == "user" else [{"type": "text", "text": text}]
+            f.write(json.dumps({"type": role, "timestamp": "2026-10-01T20:00:00Z", "message": {"content": content}}) + "\n")
+    metrics = os.path.join(tmp, "handoff/metrics.jsonl")
+    SEAT["reply"] = json.dumps({
+        "open_threads": [{"thread": "The exporter still drops the header row", "turn": 1},
+                         {"thread": "The server is up. Now the real run.", "turn": 1}],
+        "decisions": [],
+        "watch_outs": [{"text": "the export dir is shared with CI", "turn": 3},
+                       {"text": "Want me to go ahead?", "turn": 3}]})
+    JUDGE["rules"] = [(None, "Now the real run", NARR), (None, "Want me to go ahead", NARR)]
+
+    def seat(sid, *extra, env=None):
+        sh(["handoff", "--root", tmp, "--transcript", t, "--sid8", sid], tmp)
+        rc, out, err = sh(["draft", "--root", tmp, "--transcript", t, "--sid8", sid, "--model", SPEC] + list(extra), tmp)
+        d = json.load(open(os.path.join(tmp, "handoff/drafts/{}.json".format(sid))))
+        rows = [json.loads(l) for l in open(metrics) if '"draft_seat"' in l and sid in l]
+        return rc, out + err, d, rows[-1] if rows else {}
+
+    def claims(d):
+        return [e.get("thread") for e in d["open_threads"]] + [e.get("text") for e in d["watch_outs"]]
+
+    rc, out, d0, row = seat("judg0000")
+    check("judge: without a judge the gate keeps the narration (the gap this closes)",
+          "The server is up. Now the real run." in claims(d0) and "Want me to go ahead?" in claims(d0)
+          and "judge" not in row and not JUDGE["requests"], claims(d0))
+
+    rc, out, d, row = seat("judg0001", "--judge", "fake-judge@" + JBASE)
+    check("judge: confident narration is dropped, forward-intent and hazards stay",
+          rc == 0 and claims(d) == ["The exporter still drops the header row", "the export dir is shared with CI"], out + json.dumps(claims(d)))
+    check("judge: metrics carry judge, judged, dropped; `kept` stays the gate's count",
+          row.get("judge") == ["fake-judge"] and row.get("judged") == 4 and row.get("dropped") == 2
+          and row.get("kept") == 4 and len(row.get("rows") or []) == 4, row)
+    check("judge: the state sent is the claim text only, on the System One wire",
+          sorted(r["state"] for r in JUDGE["requests"][-4:]) == sorted(claims(d0))
+          and all(set(r["questions"]["q"]["criteria"]) == {"forward", "settled", "hazard", "narration"}
+                  for r in JUDGE["requests"][-4:]), JUDGE["requests"][-4:])
+
+    # a person's authored entry is never sent to the judge, and survives
+    dp = os.path.join(tmp, "handoff/drafts/judg0002.json")
+    sh(["handoff", "--root", tmp, "--transcript", t, "--sid8", "judg0002"], tmp)
+    dd = json.load(open(dp))
+    dd["watch_outs"] = [{"text": "Now the real run is mine to call.", "tier": "authored"}]
+    json.dump(dd, open(dp, "w"))
+    n = len(JUDGE["requests"])
+    sh(["draft", "--root", tmp, "--transcript", t, "--sid8", "judg0002", "--model", SPEC, "--judge", "fake-judge@" + JBASE], tmp)
+    dd = json.load(open(dp))
+    check("judge: an authored entry is never judged and never dropped",
+          {"text": "Now the real run is mine to call.", "tier": "authored"} in dd["watch_outs"]
+          and all("mine to call" not in r["state"] for r in JUDGE["requests"][n:]), dd["watch_outs"])
+
+    # below tau stays: argmax narration at 0.4 is not confident narration
+    JUDGE["rules"] = [(None, "Now the real run", {"forward": 0.3, "settled": 0.15, "hazard": 0.15, "narration": 0.4})]
+    rc, out, d, row = seat("judg0003", "--judge", "fake-judge@" + JBASE)
+    check("judge: narration below tau is kept", "The server is up. Now the real run." in claims(d) and row.get("dropped") == 0, row)
+
+    # two judges are averaged: one sure it is narration, one sure it is not -> kept
+    JUDGE["rules"] = [("judge-a", "Now the real run", {"forward": 0.0, "settled": 0.05, "hazard": 0.05, "narration": 0.9}),
+                      ("judge-b", "Now the real run", {"forward": 0.9, "settled": 0.05, "hazard": 0.0, "narration": 0.05}),
+                      (None, "Want me to go ahead", NARR)]
+    rc, out, d, row = seat("judg0004", "--judge", "judge-a@{0},judge-b@{0}".format(JBASE))
+    check("judge: two judges are averaged — disagreement keeps, agreement drops",
+          "The server is up. Now the real run." in claims(d) and "Want me to go ahead?" not in claims(d)
+          and row.get("judge") == ["judge-a", "judge-b"] and row.get("dropped") == 1, row)
+
+    # one of two judges down: nothing is dropped on half an answer
+    rc, out, d, row = seat("judg0005", "--judge", "judge-a@{},judge-b@http://127.0.0.1:{}".format(JBASE, free_port()))
+    check("judge: one judge down keeps everything (no drop on half an ensemble), counted silent",
+          claims(d) == claims(d0) and row.get("dropped") == 0 and row.get("judge_silent") == 4, row)
+
+    # judge down / budget spent: everything the gate kept stays, rc 0
+    rc, out, d, row = seat("judg0006", "--judge", "fake-judge@http://127.0.0.1:{}".format(free_port()))
+    check("judge: a dead judge keeps every entry, rc 0, counted silent not judged",
+          rc == 0 and claims(d) == claims(d0) and row.get("judge_silent") == 4 and row.get("judged") == 0, out)
+    rc, out, d, row = seat("judg0007", "--judge", "fake-judge@" + JBASE, "--judge-budget", "0")
+    check("judge: a spent budget keeps every entry, counted unjudged",
+          claims(d) == claims(d0) and row.get("unjudged") == 4 and row.get("dropped") == 0, row)
+
+    # SessionEnd: SHED_JUDGE rides along with SHED_MODEL and the archive is what survives both
+    JUDGE["rules"] = [(None, "Now the real run", NARR), (None, "Want me to go ahead", NARR)]
+    env = {k: v for k, v in os.environ.items() if k not in ("SHED_MODEL", "SHED_ENDPOINT", "SHED_JUDGE")}
+
+    def hook(event, sid, extra_env=None):
+        p = json.dumps({"session_id": sid + "xxxx", "transcript_path": t, "cwd": tmp})
+        return subprocess.run([PY, SHED, "hook", event], cwd=tmp, input=p, capture_output=True, text=True,
+                              env=dict(env, **(extra_env or {})))
+    hook("stop", "judg0008")
+    r = hook("session-end", "judg0008", {"SHED_MODEL": SPEC, "SHED_JUDGE": "fake-judge@" + JBASE})
+    a = [f for f in os.listdir(os.path.join(tmp, "handoff/sessions")) if f.endswith("__judg0008.json")]
+    a = json.load(open(os.path.join(tmp, "handoff/sessions", a[0]))) if a else {}
+    check("judge: SessionEnd with SHED_JUDGE finalizes without the narration",
+          r.returncode == 0 and claims(a) == ["The exporter still drops the header row", "the export dir is shared with CI"]
+          if a else False, r.stdout + r.stderr)
 
 srv.shutdown()
 
