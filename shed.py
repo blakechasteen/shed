@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""shed — the coordination protocol over files in git. First slice: orient + handoff.
+"""shed — the coordination protocol over files in git: orient, declare, handoff, woosh, sweep, proof.
 
 A *shed* is the opening in the warp that the pick passes through: the space a
 session works in, made fresh each pass. This tool holds the state of a project
@@ -7,7 +7,6 @@ between sessions in plain files, so that any worker — a person, a Claude Code
 session, another agent — can pick the work up cold.
 
 Six verbs make up the protocol: orient, declare, handoff, woosh, sweep, proof.
-This slice ships three of them:
 
   orient    read the last handoff + git state (+ open briefs if any) -> one page
   declare   one sentence of what this session means to do, before it touches
@@ -22,13 +21,21 @@ This slice ships three of them:
             synthesis, and one extractiveness number over the ungated prose
             makes drift a trend instead of a feeling.
 
+  woosh     write handoff/brief/<slug>.md: a standing suggestion with a required
+            done_when. Suggestion, never directive.
+  sweep     the decay vent. A brief with no BODY edit in 30d (or past its own
+            `expires`) has already left the page; sweep lists it, and --apply
+            flips it declined, AGED OUT, never judged. Holds global/done_check.
+  proof     a commit that claims a number shows a proof block (checked / cmd /
+            evidence) or a Proof-Block: trailer. Form only. Opt-in commit-msg hook.
+
   draft     the draft seat (optional): a local model proposes open_threads /
             decisions / watch_outs; only entries the evidence gate passes are
             written. The gate judges, the model is the variable. An optional
             typed judge (SHED_JUDGE: Kev / Mica) may then drop kept entries
             that are status narration — drop only, never add; silence keeps.
 
-Both are wired into Claude Code as hooks so no prompt has to ask for them:
+Orient and handoff are wired into Claude Code as hooks so no prompt has to ask for them:
 SessionStart runs orient and injects the page; Stop refreshes the draft;
 SessionEnd runs the draft seat once (when SHED_MODEL is set) and finalizes.
 Instructions get skipped; hooks do not.
@@ -46,9 +53,14 @@ usage:
   shed.py handoff [--root DIR] [--transcript FILE] [--sid8 X] [--finalize] [--share FIELD]...
   shed.py draft   [--root DIR] [--transcript FILE] [--sid8 X] [--model NAME[@URL]] [--budget CHARS] [--timeout S]
                   [--judge NAME[@URL][,...]] [--judge-tau P] [--judge-budget S]
+  shed.py woosh   <slug> "<title>" --done-when TEXT [--done-check CMD --expires YYYY-MM-DD] [--topic T]
+                  [--global] [--interpreted-by MODEL] [--body FILE|-] [--root DIR] [--sid8 X]
+  shed.py sweep   [--apply] [--run-checks] [--idle-days N] [--root DIR]
+  shed.py sweep   --flip SLUG --to open|consumed|superseded|declined [--note WHY]
+  shed.py proof   [--range A..B | --message FILE] [--tally] [--root DIR]
   shed.py verify  <shared archive> [--root DIR]
   shed.py check   SCHEMA FILE                          # form only, against schemas/<SCHEMA>.json
-  shed.py install [--root DIR]
+  shed.py install [--root DIR] [--proof-hook]
   shed.py hook (session-start|stop|session-end)      # JSON on stdin
 
 The protocol's file formats are JSON Schema under schemas/ (record, intent, thread, decision,
@@ -64,6 +76,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -313,44 +326,159 @@ def parse_frontmatter(text):
     return fm, text[m.end():]
 
 
-def open_briefs(root, now=None):
-    """Open briefs touched within DECAY_DAYS, newest `created` first. Touch = any commit on the
-    file in the window (one git call for the whole directory), falling back to fs mtime when the
-    repo has no history. Frontmatter housekeeping is not distinguished from body edits here."""
-    now = now or utcnow()
+# The decay clock reads BODY edits only. A frontmatter pass (a topic retrofit, a pushed-out date) must
+# not reset it: hololoom_mcp measured 2026-08-23 that bulk housekeeping had touched 148 of 154 open
+# briefs inside 29 days, so an any-commit clock vented 6 where the body clock vents 60. A diff counts
+# as frontmatter-only when every changed line is frontmatter-SHAPED and every hunk ENDS on or before
+# the file's own closing fence; anything ambiguous reads as engagement and keeps the brief open — a
+# wrong keep costs a line on a page, a wrong decline buries live work. Shape alone is not enough
+# (`Update: half built` and an indented sub-bullet are prose that looks like YAML), and neither is
+# brief_sweep's fixed 60-line bound (most briefs are shorter than 60 lines, so it bounded nothing —
+# adversarial pass 2026-10-04). The fence is read from the file as it is now; a frontmatter that has
+# since grown can only move the bound later, and the shape test still has to pass.
+FM_DIFF_LINE = re.compile(r"^[+-](\s{2,}\S|[A-Za-z][A-Za-z0-9_]*\s*:|---\s*$|\s*$)")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+BRIEF_STATUSES = ("open", "consumed", "superseded", "declined")
+
+
+def brief_files(root):
     bdir = paths(root)["briefs"]
-    files = [f for f in sorted(glob.glob(os.path.join(bdir, "*.md"))) if not os.path.basename(f).startswith("_")]
-    if not files:
-        return [], 0
-    # log paths are relative to the repo TOPLEVEL, ls-files paths to the cwd (= root)
+    return [f for f in sorted(glob.glob(os.path.join(bdir, "*.md"))) if not os.path.basename(f).startswith("_")]
+
+
+def fence_line(path):
+    """1-based line number of the closing `---` fence, or 0 when the file has no frontmatter."""
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            text = f.read()
+    except OSError:
+        return 0
+    m = FM_RE.match(text)
+    return m.group(0)[:m.end(1) - m.start(0)].count("\n") + 2 if m else 0
+
+
+def zsplit(out):
+    return [x for x in (out or "").split("\0") if x]
+
+
+def body_clock(root, days=DECAY_DAYS):
+    """(edited, tracked, dirty): sets of REAL brief paths with a BODY-changing commit inside
+    `days`, under version control, and uncommitted right now. Real, not normalized: git names the
+    toplevel by its resolved path (macOS /private/var/…) while the glob keeps the caller's
+    (/var/…), and a path compared across the two never matches — every edit reads as silence. One `git log -p` for the directory,
+    over HEAD and trunk both — a checkout can lag trunk, and engagement pushed from elsewhere must
+    count (brief_sweep measured the miss 2026-09-09). Empty sets when git cannot read."""
+    bdir = paths(root)["briefs"]
     top = git(root, "rev-parse", "--show-toplevel")
-    touched_log = git(root, "log", "--since={}.days.ago".format(DECAY_DAYS), "--name-only", "--format=", "--", bdir)
-    tracked_ls = git(root, "ls-files", "--", bdir)
-    touched, tracked = set(), set()
-    if top and touched_log is not None:
-        touched = {os.path.normpath(os.path.join(top, l.strip())) for l in touched_log.splitlines() if l.strip()}
-    if tracked_ls is not None:
-        tracked = {os.path.normpath(os.path.join(root, l.strip())) for l in tracked_ls.splitlines() if l.strip()}
+    trunk = trunk_ref(root)
+    revs = ["HEAD"] + ([trunk] if trunk else [])
+    # quotePath off: a non-ASCII name is otherwise octal-escaped in quotes and never matches its file
+    log = git(root, "-c", "core.quotePath=false", "log", *revs, "--since={}.days.ago".format(days),
+              "--format=@%H", "-p", "--unified=0", "--", bdir)
+    edited, fences = set(), {}
+    cur, lines, max_line = None, [], 0
+
+    def flush():
+        if cur:
+            if cur not in fences:
+                fences[cur] = fence_line(cur)
+            real = [l for l in lines if l[1:].strip() not in ("", "---")]
+            if not (real and all(FM_DIFF_LINE.match(l) for l in real) and max_line <= fences[cur]):
+                edited.add(cur)
+
+    for line in (log or "").splitlines() if top else ():
+        if line.startswith("@@"):
+            m = HUNK_RE.match(line)
+            if m:  # the LAST line each side touches, not where the hunk starts
+                o_start, o_len, n_start, n_len = (int(g) if g is not None else 1 for g in m.groups())
+                max_line = max(max_line, o_start + max(o_len, 1) - 1, n_start + max(n_len, 1) - 1)
+            else:
+                max_line = 10 ** 9  # unreadable hunk header: engagement
+        elif line.startswith("@") and not line.startswith("@@"):
+            flush()
+            cur, lines, max_line = None, [], 0
+        elif line.startswith("+++ "):
+            flush()
+            p = line[4:].strip()
+            cur = os.path.realpath(os.path.join(top, p[2:])) if p.startswith("b/") else None
+            lines, max_line = [], 0
+        elif line.startswith(("--- ", "diff ", "index ", "new file", "deleted file", "similarity", "rename ")):
+            continue
+        elif cur and line[:1] in "+-":
+            lines.append(line)
+    flush()
+    # -z: NUL-separated and never quoted, so a space or a non-ASCII name survives (porcelain quotes both)
+    tracked = {os.path.realpath(os.path.join(root, l)) for l in zsplit(git(root, "ls-files", "-z", "--", bdir))}
+    dirty, entries = set(), zsplit(git(root, "status", "--porcelain", "-z", "--", bdir))
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        i += 1
+        if e[:1] in "RC":
+            i += 1  # a rename/copy carries its source path as the next entry
+        if len(e) > 3 and e[:2] != "??":
+            dirty.add(os.path.realpath(os.path.join(top or root, e[3:])))
+    return edited, tracked, dirty
+
+
+def brief_age(path, fm, clock, now, days=DECAY_DAYS):
+    """None when the brief is live — created, body-edited, or being edited (dirty) inside `days` —
+    else a short reason it is not. An untracked brief, or one in a repo with no history, falls back
+    to the filesystem clock: the only one there is."""
+    edited, tracked, dirty = clock
+    p = os.path.realpath(path)
+    created = parse_iso((fm.get("created") or "")[:10])
+    if created and now - created <= timedelta(days=days):
+        return None
+    if p in dirty:
+        return None
+    if p in tracked:
+        return None if p in edited else "no body edit in {}d".format(days)
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+    except OSError:
+        return "unreadable"
+    return None if now - mtime <= timedelta(days=days) else "untouched on disk {}d".format((now - mtime).days)
+
+
+def brief_expired(fm, now):
+    """The author's own dated backstop (`expires: YYYY-MM-DD`, the lease rider) has passed."""
+    exp = parse_iso((fm.get("expires") or "")[:10])
+    return bool(exp and now.date() > exp.date())
+
+
+def read_briefs(root):
+    """[(path, frontmatter, text)] for every brief file that reads."""
     out = []
-    for f in files:
+    for f in brief_files(root):
         try:
             with open(f, encoding="utf-8") as fh:
-                fm, _ = parse_frontmatter(fh.read())
+                text = fh.read()
         except OSError:
             continue
-        if fm.get("status", "open") != "open" or not fm.get("done_when"):
-            continue
-        nf = os.path.normpath(f)
-        if nf in tracked:
-            recent = nf in touched
-        else:  # untracked, or no git at all: the filesystem is the only clock
-            recent = now - datetime.fromtimestamp(os.path.getmtime(f), timezone.utc) <= timedelta(days=DECAY_DAYS)
-        if not recent:
+        fm, _ = parse_frontmatter(text)
+        out.append((f, fm, text))
+    return out
+
+
+def open_briefs(root, now=None):
+    """(shown, live_total, decayed_total). Open briefs with a done_when that are live by the body
+    clock and inside their own `expires`, newest `created` first. The SAME predicate `sweep`
+    vents on, so the page and the files can never disagree about what decayed."""
+    now = now or utcnow()
+    briefs = [(f, fm) for f, fm, _ in read_briefs(root) if fm.get("status", "open") == "open" and fm.get("done_when")]
+    if not briefs:
+        return [], 0, 0
+    clock = body_clock(root)
+    out, decayed = [], 0
+    for f, fm in briefs:
+        if brief_age(f, fm, clock, now) or brief_expired(fm, now):
+            decayed += 1
             continue
         out.append({"title": fm.get("title", os.path.basename(f)), "created": fm.get("created", "?"),
                     "path": os.path.relpath(f, root)})
     out.sort(key=lambda b: b["created"], reverse=True)
-    return out[:MAX_BRIEFS], len(out)
+    return out[:MAX_BRIEFS], len(out), decayed
 
 
 # ---------------------------------------------------------------- orient
@@ -433,9 +561,11 @@ def orient_lines(root, sid8):
         for c in commits:
             L.append("  " + c)
 
-    briefs, total = open_briefs(root, now)
+    briefs, total, decayed = open_briefs(root, now)
     if briefs:
-        L.append("Open briefs (status open, touched within {}d; {} of {}, newest first):".format(DECAY_DAYS, len(briefs), total))
+        vent = "; {} decayed, not shown — `shed.py sweep` lists them".format(decayed) if decayed else ""
+        L.append("Open briefs (status open, body edited within {}d; {} of {}, newest first{}):".format(
+            DECAY_DAYS, len(briefs), total, vent))
         for b in briefs:
             L.append("  - {} ({}) {}".format(b["title"][:90], b["created"], b["path"]))
     return L
@@ -1382,9 +1512,419 @@ def cmd_verify(args, payload=None):
     return 1
 
 
+# ---------------------------------------------------------------- woosh
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
+def fold(value, indent="  "):
+    """Wrap for a folded block so parse_frontmatter's space-join gives the value back exactly: never
+    split a word or break at a hyphen ("foo-" + "bar" would rejoin as "foo- bar")."""
+    return textwrap.fill(value, 96, initial_indent=indent, subsequent_indent=indent,
+                         break_long_words=False, break_on_hyphens=False)
+
+
+YAML_RETYPED = re.compile(r"(?i)^(~|null|true|false|yes|no|on|off|y|n|[-+.]?\d.*|\.inf|\.nan)$")
+
+
+def fm_scalar(key, value, wrap=True):
+    """One frontmatter line. A value YAML would misread (a quote, a colon-space, a leading marker)
+    goes in a folded block, which needs no escaping and which parse_frontmatter joins back. wrap=False
+    keeps a shell command on one line with its spacing intact."""
+    value = " ".join(str(value).split()) if wrap else str(value).strip()
+    if not re.search(r"[\"'#\\]|: |:$|^[-?:,\[\]{}&*!|>%@`]", value):
+        if YAML_RETYPED.match(value):  # shed's reader strips the quotes; a YAML reader keeps it a string
+            return '{}: "{}"\n'.format(key, value)
+        return "{}: {}\n".format(key, value)
+    return "{}: >\n{}\n".format(key, fold(value) if wrap else "  " + value)
+
+
+def cmd_woosh(args, payload=None):
+    """`shed.py woosh <slug> "<title>" --done-when "<text>"` — write handoff/brief/<slug>.md: a
+    standing suggestion for a future session. Suggestion, never directive: the receiver accepts,
+    reshapes or declines. `done_when` is required — a brief with no retirement condition is a
+    claim on attention with no end, and orient will not show one. Refuses a slug that exists: two
+    sessions inventing the same path is the collision worktrees do not stop."""
+    root = args.root
+    slug = args.slug[:-3] if args.slug.endswith(".md") else args.slug
+    if not SLUG_RE.match(slug):
+        print("woosh: slug must be lowercase letters, digits, '-' or '_' (and not start with '_'): {!r}".format(slug))
+        return 2
+    title, done_when = " ".join(args.title.split()), " ".join(args.done_when.split())
+    if not title or not done_when:
+        print("woosh: title and --done-when must both be non-empty")
+        return 2
+    for flag, val in (("--expires", args.expires),):
+        if val and not DATE_RE.match(val):
+            print("woosh: {} must be YYYY-MM-DD, got {!r}".format(flag, val))
+            return 2
+    if args.done_check and len(args.done_check.strip().splitlines()) != 1:
+        print("woosh: --done-check is one shell command on one line")
+        return 2
+    if args.done_check and not args.expires:
+        print("woosh: --done-check needs --expires YYYY-MM-DD — a predicate with no dated backstop can never auto-close")
+        return 2
+    path = os.path.join(paths(root)["briefs"], slug + ".md")
+    if os.path.exists(path):
+        print("woosh: {} already exists — edit it, or pick another slug".format(os.path.relpath(path, root)))
+        return 1
+    if args.body == "-":
+        body = sys.stdin.read()
+    elif args.body:
+        try:
+            with open(args.body, encoding="utf-8") as f:
+                body = f.read()
+        except OSError as e:
+            print("woosh: cannot read --body {}: {}".format(args.body, e))
+            return 2
+    else:
+        body = ("**Suggestion, never directive.** A session that picks this up may accept it, reshape it, "
+                "or decline it.\n\n## Why\n\n\n## Shape\n\n")
+    now = utcnow()
+    fm = "---\n" + fm_scalar("title", title) + "status: open\n" + "created: {}\n".format(now.date().isoformat())
+    sid8 = sid8_from(args.sid8, payload)
+    if sid8 != "nosid":
+        fm += "sid8: {}\n".format(sid8)
+    if args.interpreted_by:
+        fm += fm_scalar("interpreted_by", args.interpreted_by)
+    if args.topic:
+        fm += fm_scalar("topic", args.topic)
+    if args.global_:
+        fm += "global: true\n"
+    fm += "done_when: >\n{}\n".format(fold(done_when))
+    if args.done_check:
+        fm += fm_scalar("done_check", args.done_check, wrap=False)
+    if args.expires:
+        fm += "expires: {}\n".format(args.expires)
+    text = fm + "---\n\n# {}\n\n{}".format(title, body if body.endswith("\n") else body + "\n")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "x", encoding="utf-8") as f:
+        f.write(text)
+    # parse-verify: what orient will read back is what was asked for
+    back, _ = parse_frontmatter(open(path, encoding="utf-8").read())
+    want = {"title": title, "status": "open", "done_when": done_when}
+    if args.done_check:
+        want["done_check"] = args.done_check.strip()
+    bad = [k for k, v in want.items() if back.get(k) != v]
+    if bad:
+        os.remove(path)  # ours, made a moment ago: a brief that misreads must not reach orient or --run-checks
+        print("woosh: refused — {} would not read back as written ({}); nothing was kept".format(
+            os.path.relpath(path, root), ", ".join(bad)))
+        return 1
+    metric(root, "woosh", sid8=sid8, slug=slug, armed=bool(args.done_check), dated=bool(args.expires))
+    print("wooshed -> {}".format(os.path.relpath(path, root)))
+    print("  done_when: " + done_when)
+    if args.done_check:
+        print("  done_check: {}  (expires {})".format(back["done_check"], args.expires))
+    print("  decays {}d after its last body edit{}".format(DECAY_DAYS, ", or on {}".format(args.expires) if args.expires else ""))
+    return 0
+
+
+# ---------------------------------------------------------------- sweep
+
+def flip_brief(path, to, note, sid8=None):
+    """Rewrite ONLY the top-level status line inside the first fence and append a dated lifecycle note
+    to the body. Everything else stays byte-for-byte — line endings, the blank line after the fence,
+    an indented `status:` inside a folded block. The new text is parse-verified BEFORE it is written,
+    so a failed flip leaves the file as it was. Returns (old_status, error) — error None on success."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    m = FM_RE.match(text)
+    if not m:
+        return None, "no frontmatter fence"
+    before = parse_frontmatter(text)[0]
+    old = before.get("status", "open")
+    if old == to:
+        return old, None
+    nl = "\r\n" if "\r\n" in text else "\n"
+    a, b = m.span(1)
+    head, n = re.subn(r"(?m)^status[ \t]*:[^\r\n]*", "status: " + to, text[a:b], count=1)
+    if not n:
+        head = "status: " + to + nl + head
+    out = text[:a] + head + text[b:]
+    if not out.endswith(("\n", "\r")):
+        out += nl
+    out += "{nl}_Lifecycle ({}{}): status {} → {}.{}_{nl}".format(
+        utcnow().date().isoformat(), ", sid8 " + sid8 if sid8 and sid8 != "nosid" else "", old, to,
+        " " + note if note else "", nl=nl)
+    after = parse_frontmatter(out)[0]
+    if after.get("status") != to or {k: v for k, v in after.items() if k != "status"} != {k: v for k, v in before.items() if k != "status"}:
+        return old, "the flip would change more than status — file left as it was"
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(out)
+    os.replace(tmp, path)
+    return old, None
+
+
+def cmd_sweep(args, payload=None):
+    """`shed.py sweep [--apply] [--run-checks] | --flip <slug> --to <status>` — the decay vent.
+
+    Lists every open brief that orient has stopped showing: no body edit in DECAY_DAYS, or past the
+    author's own `expires`. DRY-RUN unless --apply, which flips those to `declined` with an
+    `expired-unclaimed` note. `declined` here means AGED OUT, never judged: hololoom_mcp walked 8
+    stale-open briefs (2026-07-05) and 4 were finished work nobody flipped. Two holds are surfaced and
+    never auto-flipped: `global` (load-bearing; a quiet one is a thing to read) and `done_check`
+    (its disposition may be `consumed`). --run-checks runs each open brief's done_check — explicitly,
+    because a sweep must not run shell from repo files as a side effect — and names the ones that
+    hold as ready to flip; it flips nothing. The hooks never sweep."""
+    root = args.root
+    sid8 = sid8_from(args.sid8, payload)
+    if args.flip:
+        if not args.to:
+            print("sweep: --flip needs --to {}".format("|".join(BRIEF_STATUSES)))
+            return 2
+        slug = os.path.basename(args.flip)
+        path = os.path.join(paths(root)["briefs"], slug if slug.endswith(".md") else slug + ".md")
+        if not os.path.isfile(path):
+            print("sweep: no brief {}".format(os.path.relpath(path, root)))
+            return 2
+        old, err = flip_brief(path, args.to, args.note, sid8)
+        if err:
+            print("sweep: {}: {}".format(os.path.relpath(path, root), err))
+            return 1
+        if old == args.to:
+            print("{} already {} — no-op".format(os.path.relpath(path, root), args.to))
+            return 0
+        metric(root, "sweep_flip", sid8=sid8, slug=slug[:-3] if slug.endswith(".md") else slug, to=args.to)
+        print("flipped {}: {} → {}".format(os.path.relpath(path, root), old, args.to))
+        return 0
+
+    now = utcnow()
+    briefs = read_briefs(root)
+    clock = body_clock(root, args.idle_days)
+    due, held, live, no_done = [], [], 0, []
+    for f, fm, _ in briefs:
+        if fm.get("status", "open") != "open":
+            continue
+        rel = os.path.relpath(f, root)
+        if not fm.get("done_when"):
+            no_done.append(rel)
+            continue
+        why = brief_age(f, fm, clock, now, args.idle_days)
+        if brief_expired(fm, now):
+            why = "expires {} passed".format(fm["expires"][:10])
+        if not why:
+            live += 1
+            continue
+        hold = "global" if str(fm.get("global", "")).lower() in ("true", "yes", "1") else (
+            "done_check" if fm.get("done_check") else "")
+        (held if hold else due).append((rel, fm, why, hold))
+    print("# sweep — {} open: {} live, {} due to decay, {} held{}".format(
+        live + len(due) + len(held), live, len(due), len(held), "" if args.apply else " (dry run)"))
+    for rel, fm, why, _ in due:
+        print("  due   {}  — {}".format(rel, why))
+    for rel, fm, why, hold in held:
+        print("  held  {}  — {} [{}: dispose by hand]".format(rel, why, hold))
+    if no_done:
+        print("  {} open brief{} without done_when (orient never shows these): {}".format(
+            len(no_done), "" if len(no_done) == 1 else "s", ", ".join(no_done)))
+
+    ready = []
+    if args.run_checks:
+        for f, fm, _ in briefs:
+            if fm.get("status", "open") != "open" or not fm.get("done_check"):
+                continue
+            verdict, rc = run_discharge({"cmd": fm["done_check"]}, root)
+            rel = os.path.relpath(f, root)
+            print("  check {}  — {} (rc {})".format(rel, verdict, rc))
+            if verdict == "MET":
+                ready.append(rel)
+        for rel in ready:
+            print("  ready: shed.py sweep --flip {} --to consumed".format(os.path.basename(rel)[:-3]))
+
+    if not args.apply:
+        if due:
+            print("Nothing written. `shed.py sweep --apply` declines the {} due; reversible with --flip <slug> --to open.".format(len(due)))
+        metric(root, "sweep", sid8=sid8, live=live, due=len(due), held=len(held), applied=0, ready=len(ready))
+        return 0
+    failed = 0
+    for rel, fm, why, _ in due:
+        note = ("expired-unclaimed — {} (shed sweep, {}d vent). AGED OUT, not judged: it may be finished work "
+                "nobody flipped. Reversible: shed.py sweep --flip {} --to open.").format(
+                    why, args.idle_days, os.path.basename(rel)[:-3])
+        _, err = flip_brief(os.path.join(root, rel), "declined", note, sid8)
+        if err:
+            failed += 1
+            print("  FAILED {}: {}".format(rel, err))
+    print("vent: {} declined, {} failed, {} held".format(len(due) - failed, failed, len(held)))
+    metric(root, "sweep", sid8=sid8, live=live, due=len(due), held=len(held), applied=len(due) - failed, ready=len(ready))
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- proof
+
+# A commit message that asserts a QUANTITATIVE result must show a proof block (checked: / cmd: /
+# evidence:) or say, auditably, why not. Form only — it never judges whether the evidence is real,
+# and the cheapest way past it is to stop claiming, which nothing measures. Ported from
+# hololoom_mcp/tools/proofblock_gate.py + proof_block_sample.py; the regexes are theirs verbatim,
+# and their comments carry the measurements (the quantitative subset runs ~5% false positives; the
+# broad claim matcher ran 43% and is deliberately not used).
+QUANT_RE = re.compile(r"(\b\d+/\d+\b|\bexits? \d|\bALL PASS\b|recall@|\brc=\d|\b\d+ passed\b)", re.I)
+QUANT_FALSE_FRIEND_RE = re.compile(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|/\d+/|\bv?\d+\.\d+/|\b\d+/\d+(?:/\d+)+\b)")
+_K = r"[`*_\"']*(?:\s*\([^)]{0,120}\))?[`*_\"']*\s*[:=]"
+CHECKED_RE = re.compile(r"\bchecked" + _K, re.I)
+CMD_RE = re.compile(r"\bcmd" + _K + r"|\bcommand" + _K + r"|^\s*\$ ", re.I | re.M)
+EVIDENCE_RE = re.compile(r"\bevidence" + _K + r"|\boutput" + _K, re.I)
+# `Proof-Block: none (<reason>)` — the reason may wrap, but its closing paren ends its line, so prose
+# that merely quotes the form does not match. `Proof-Block: <ref>` — the block lives in an artifact.
+EXEMPT_RE = re.compile(r"^[^\S\n]*Proof-Block:[^\S\n]*none[^\S\n]*\([^)]+\)[^\S\n]*$", re.I | re.M)
+POINTER_RE = re.compile(r"^[^\S\n]*Proof-Block:[^\S\n]*(?!none\b)\S+.*$", re.I | re.M)
+PROOF_CLASSES = ("merge", "no-claim", "with-block", "exempt", "pointer", "blocked")
+
+
+def quant_claims(body):
+    hits = []
+    for raw in re.split(r"\n|(?<=[.!?])\s+", body):
+        s = raw.strip()
+        if len(s) >= 8 and QUANT_RE.search(QUANT_FALSE_FRIEND_RE.sub(" ", s)):
+            hits.append(s[:160])
+    return hits
+
+
+def classify_message(body):
+    """(class, ok, reason, first_claim). A SHOWN block outranks every declaration: a commit that
+    did the work is never filed as an opt-out (hololoom_mcp ruling, 2026-08-30)."""
+    claims = quant_claims(body)
+    if not claims:
+        return "no-claim", True, "no quantitative claim", ""
+    missing = [n for n, rx in (("checked:", CHECKED_RE), ("cmd:", CMD_RE), ("evidence:", EVIDENCE_RE)) if not rx.search(body)]
+    if not missing:
+        return "with-block", True, "proof block present", ""
+    if EXEMPT_RE.search(body):
+        return "exempt", True, "Proof-Block: none (...)", ""
+    if POINTER_RE.search(body):
+        return "pointer", True, "Proof-Block: <ref>", ""
+    return "blocked", False, "missing " + ", ".join(missing), claims[0]
+
+
+def kept_message(raw, comment_char=None):
+    """The part of a commit-msg hook's file git will store. The hook runs BEFORE git's cleanup, and
+    the cleanup depends on how the commit was made: an editor session strips comment lines and
+    everything under the scissors line; `-m` / `-F` keep comment lines. The editor template is the
+    tell — strip only when it is there, so `#41: 12/12 green` from `-m` is judged as git will store
+    it, the same way `proof --range` will judge it later. The comment char is git's own
+    (core.commentChar; `auto` or unset reads it off the scissors line, else `#`)."""
+    cc = comment_char if comment_char and comment_char != "auto" else None
+    m = re.search(r"(?m)^(\S+) -{24} >8 -{24}[ \t]*$", raw)
+    if m:
+        cc = cc or m.group(1)
+        raw = raw[:m.start()]
+    cc = cc or "#"
+    template = m or re.search(r"(?m)^" + re.escape(cc) + r" (Please enter the commit message|Lines starting with)", raw)
+    if template:
+        raw = "\n".join(l for l in raw.splitlines() if not l.startswith(cc))
+    return raw
+
+
+def cmd_proof(args, payload=None):
+    """`shed.py proof [--range A..B] [--message FILE] [--tally]` — rc 1 when a commit (or the message
+    a commit-msg hook hands over) claims a quantitative result with no proof block and no
+    `Proof-Block:` trailer. --tally counts the classes and always exits 0: the tripwire is the RATIO
+    of declarations to shown blocks — a gate that collects `none (...)` lines is measuring nothing."""
+    root = args.root
+    if args.message:
+        try:
+            with open(args.message, encoding="utf-8") as f:
+                body = f.read()
+        except OSError as e:
+            print("proof: cannot read {}: {}".format(args.message, e))
+            return 2
+        body = kept_message(body, git(root, "config", "core.commentChar"))
+        cls, ok, reason, claim = classify_message(body)
+        if not ok:
+            print("proof: this message claims a quantitative result with no proof block ({}).".format(reason))
+            print("  claim: " + claim)
+            print("  add `checked: … / cmd: <exact command> / evidence: <output you read>`, or a trailer:")
+            print("    Proof-Block: none (<why no block>)      or      Proof-Block: <path#section>")
+            return 1
+        return 0
+    note = ""
+    if args.range:
+        spec = args.range.split()
+    else:
+        trunk = trunk_ref(root)
+        if trunk:
+            spec = [trunk + "..HEAD"]
+        else:
+            spec, note = ["-1", "HEAD"], "note: no origin/main — checking HEAD only"
+    out = git(root, "log", "--format=%H", *spec)
+    if out is None:
+        print("proof: git log failed for {} — instrument silent, not a verdict".format(" ".join(spec)))
+        return 2
+    shas = [s for s in out.splitlines() if s.strip()]
+    if note:
+        print(note)
+    counts = dict((c, 0) for c in PROOF_CLASSES)
+    blocked = []
+    for sha in shas:
+        meta = git(root, "show", "-s", "--format=%P%x00%B", sha)
+        if meta is None:
+            print("proof: cannot read {} — instrument silent".format(sha[:12]))
+            return 2
+        parents, _, body = meta.partition("\x00")
+        if len(parents.split()) > 1:
+            cls, ok, reason, claim = "merge", True, "", ""  # the branch commits carry the claim; gate those
+        else:
+            cls, ok, reason, claim = classify_message(body)
+        counts[cls] += 1
+        if not ok:
+            blocked.append((sha, body.splitlines()[0] if body else "", reason, claim))
+    rng = " ".join(spec)
+    if args.tally:
+        shown = counts["with-block"]
+        declared = counts["exempt"] + counts["pointer"]
+        print("proof --tally {}: {} commits — {}".format(rng, len(shas), ", ".join("{} {}".format(v, k) for k, v in counts.items() if v)))
+        if not shas:
+            head = git(root, "rev-parse", "--short", "HEAD")
+            print("  CONTROL: HEAD={} (an empty range is not a clean one)".format(head or "<git silent too>"))
+        elif declared and declared >= shown:
+            print("  TRIPWIRE: declarations ({}) >= shown blocks ({}) — the gate is collecting opt-outs; hand-read them".format(declared, shown))
+        return 0
+    metric(root, "proof", range=rng, commits=len(shas), blocked=len(blocked))
+    for sha, subj, reason, claim in blocked:
+        print("BLOCKED {} {}\n  {}; claim: {}".format(sha[:12], subj[:80], reason, claim))
+    if blocked:
+        print("{} of {} commits in {} claim a number with no proof block".format(len(blocked), len(shas), rng))
+        return 1
+    print("proof: {} commits in {}, none blocked".format(len(shas), rng))
+    return 0
+
+
+PROOF_HOOK_MARK = "# shed: proof"
+
+
+def install_proof_hook(root, me_rel):
+    """Write a git commit-msg hook that runs `proof --message`. Opt-in (`install --proof-hook`):
+    .git/hooks is per clone and not ours to touch unasked. Refuses to replace a hook it did not
+    write. Fails OPEN when python3 is missing — a gate that blocks every commit for want of an
+    interpreter teaches people to delete it — and when shed.py is absent from this checkout (a branch
+    from before it was committed), for the same reason."""
+    # --git-path already honours core.hooksPath, `~` included; resolving it by hand wrote hooks git never ran
+    rel = git(root, "rev-parse", "--git-path", "hooks")
+    if rel is None:
+        return "not a git repository — no commit-msg hook written"
+    hooks_dir = rel if os.path.isabs(rel) else os.path.join(root, rel)
+    path = os.path.join(hooks_dir, "commit-msg")
+    if os.path.exists(path):
+        if PROOF_HOOK_MARK in open(path, encoding="utf-8", errors="replace").read():
+            return "commit-msg hook already installed"
+        return "commit-msg hook exists and is not shed's — left alone; add this line to it: {}".format(
+            'python3 {} proof --message "$1" || exit 1'.format(me_rel))
+    os.makedirs(hooks_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n{} — a commit that claims a number shows how it was read (shed.py proof)\n"
+                'command -v python3 >/dev/null 2>&1 || {{ echo "shed proof: no python3, not checked" >&2; exit 0; }}\n'
+                '[ -f {ref} ] || {{ echo "shed proof: "{ref}" not in this checkout, not checked" >&2; exit 0; }}\n'
+                'exec python3 {ref} proof --message "$1"\n'.format(PROOF_HOOK_MARK, ref=me_rel))
+    os.chmod(path, 0o755)
+    return "commit-msg hook: {}".format(os.path.relpath(path, root))
+
+
 # ---------------------------------------------------------------- install
 
-HOOK_EVENTS = {"SessionStart": "session-start", "Stop": "stop", "SessionEnd": "session-end"}
+HOOK_EVENTS ={"SessionStart": "session-start", "Stop": "stop", "SessionEnd": "session-end"}
 
 
 def cmd_install(args, payload=None):
@@ -1435,6 +1975,14 @@ def cmd_install(args, payload=None):
         pass
     print("hooks: {} (settings: {})".format(", ".join(added) if added else "already installed",
                                             os.path.relpath(settings_path, root)))
+    if getattr(args, "proof_hook", False):
+        # git runs a hook from the worktree root, so a same-checkout shed.py is addressed relative to it
+        # (every worktree of the clone shares the one hooks dir); otherwise by absolute path.
+        if top_root and top_me and os.path.realpath(top_root) == os.path.realpath(top_me):
+            hook_ref = '"{}"'.format(os.path.relpath(os.path.realpath(me), os.path.realpath(top_root)))
+        else:
+            hook_ref = '"{}"'.format(me)
+        print(install_proof_hook(root, hook_ref))
     return 0
 
 
@@ -1547,8 +2095,41 @@ def main(argv=None):
     v.add_argument("--root", default=".")
     v.set_defaults(fn=cmd_verify)
 
+    w = sub.add_parser("woosh", help="write handoff/brief/<slug>.md — a standing suggestion for a future session")
+    w.add_argument("slug", help="file name under handoff/brief/, lowercase, no .md needed")
+    w.add_argument("title", help="one line: what the work is")
+    w.add_argument("--done-when", required=True, help="the retirement condition, in words (required: orient hides a brief without one)")
+    w.add_argument("--done-check", help="one shell command that exits 0 when the work is already done; needs --expires")
+    w.add_argument("--expires", help="YYYY-MM-DD: the author's dated backstop; sweep declines it after this")
+    w.add_argument("--topic")
+    w.add_argument("--global", dest="global_", action="store_true", help="show on every page, not only topic-matched ones (sparingly)")
+    w.add_argument("--interpreted-by", help="model id when a model wrote the brief; omit when a person did")
+    w.add_argument("--body", help="FILE with the brief's prose, or - for stdin (default: a short stub)")
+    w.add_argument("--root", default=".")
+    w.add_argument("--sid8")
+    w.set_defaults(fn=cmd_woosh)
+
+    sw = sub.add_parser("sweep", help="the decay vent: list (or --apply) briefs past 30d without a body edit or past expires")
+    sw.add_argument("--apply", action="store_true", help="flip the due briefs to declined (dry run otherwise)")
+    sw.add_argument("--run-checks", action="store_true", help="run each open brief's done_check and name the ones ready to flip")
+    sw.add_argument("--idle-days", type=int, default=DECAY_DAYS)
+    sw.add_argument("--flip", metavar="SLUG", help="flip one brief's status by hand (with --to)")
+    sw.add_argument("--to", choices=BRIEF_STATUSES)
+    sw.add_argument("--note", help="with --flip: why, appended to the brief's lifecycle line")
+    sw.add_argument("--root", default=".")
+    sw.add_argument("--sid8")
+    sw.set_defaults(fn=cmd_sweep)
+
+    pf = sub.add_parser("proof", help="fail on a commit that claims a number with no proof block (form only)")
+    pf.add_argument("--range", help="revision range (default: origin/main..HEAD)")
+    pf.add_argument("--message", metavar="FILE", help="check one commit message file (the commit-msg hook's $1)")
+    pf.add_argument("--tally", action="store_true", help="count the classes over the range; always exit 0")
+    pf.add_argument("--root", default=".")
+    pf.set_defaults(fn=cmd_proof)
+
     i = sub.add_parser("install", help="wire Claude Code hooks into <root>/.claude/settings.json")
     i.add_argument("--root", default=".")
+    i.add_argument("--proof-hook", action="store_true", help="also write a commit-msg hook that runs `proof --message`")
     i.set_defaults(fn=cmd_install)
 
     c = sub.add_parser("check", help="is <file> the shape of schemas/<schema>.json? (form only)")

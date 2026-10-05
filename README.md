@@ -1,9 +1,12 @@
 # shed
 
-The coordination protocol over files in git. Three verbs so far: **orient**,
-**declare** and **handoff** — orient and handoff wired into Claude Code as
-hooks so nobody has to remember them, declare the one sentence a session
-types before it touches files.
+The coordination protocol over files in git. Six verbs: **orient**,
+**declare**, **handoff**, **woosh**, **sweep** and **proof** — orient and
+handoff wired into Claude Code as hooks so nobody has to remember them,
+declare the one sentence a session types before it touches files, woosh a
+standing suggestion for a later session, sweep the decay vent that keeps the
+suggestions from piling up, proof the rule that a commit claiming a number
+shows how the number was read.
 
 A *shed* is the opening in the warp that the pick passes through: the space a
 session works in, made fresh each pass. `shed` holds the state of a project
@@ -15,12 +18,16 @@ The claim this is built to test:
 a small group plus agents can build large software without a large
 organization, if the coordination state lives in a portable protocol instead
 of in people. Six verbs make up that protocol — orient, declare, handoff,
-woosh, sweep, proof. This slice ships three, and the test of the slice is
-simple: **two fresh sessions in a row pick up a thread from files alone.**
+woosh, sweep, proof. The first three shipped against one test — **two fresh
+sessions in a row pick up a thread from files alone** — which passed on
+2026-10-04 in a project that had never seen shed. The other three are ports
+of tools that ran for months in the repo shed was extracted from, cut down to
+the part that is protocol.
 
 ```
 shed.py        the CLI and the hook entry points — stdlib only, Python 3.9+
-test_shed.py   182 checks, no network, no credentials: python3 test_shed.py
+test_shed.py   ~280 checks, no credentials: python3 test_shed.py (the draft-seat
+               checks bind 127.0.0.1; a sandbox that forbids it fails them by name)
 schemas/       the protocol's file formats — eight JSON Schemas + fixtures
 ```
 
@@ -76,8 +83,10 @@ with it, a session asked only to add a flag declared from the page alone.)
   its `SessionEnd` hook firing — the hook is best-effort, so this is normal)
 - commits since that session
 - open briefs, if the repo keeps `handoff/brief/*.md` with `status: open` and
-  a `done_when`, touched within 30 days — the 8 newest by `created`, with the
-  total, so a repo with hundreds still fits on the page
+  a `done_when`, created or **body-edited** within 30 days and not past its own
+  `expires` — the 8 newest by `created`, with the total and how many decayed,
+  so a repo with hundreds still fits on the page. This is the same predicate
+  `sweep` vents on: the page and the files cannot disagree about what decayed
 
 The ceiling is enforced, not advisory: the page truncates with a marker and
 `--max-lines 0` shows everything. A human reads this page, an agent gets it as
@@ -114,6 +123,99 @@ is the thread that is open. A session that declares and does not finish
 leaves the next session a page that names exactly what to pick up, with the
 command that says when it is done. `--cmd` requires `--expires`: a predicate
 with no dated backstop can never auto-close.
+
+## Woosh: a standing suggestion
+
+```sh
+python3 shed.py woosh port-parser "Port the parser to the new tokenizer" \
+    --done-when "tests/test_parser.py green on the new tokenizer" \
+    [--done-check "python3 -m pytest tests/test_parser.py -q" --expires 2026-11-15] \
+    [--topic parser] [--global] [--interpreted-by <model-id>] [--body FILE|-]
+```
+
+Writes `handoff/brief/<slug>.md`: frontmatter (`title`, `status: open`,
+`created`, `sid8`, `done_when`, and whatever was asked for) over a body that
+opens **Suggestion, never directive** — the session that picks it up accepts,
+reshapes, or declines. A handoff is a snapshot of one session; a brief is a
+standing piece of work that outlives any one of them.
+
+- **`done_when` is required.** A brief with no retirement condition is a claim
+  on attention with no end; orient will not show one.
+- **`--done-check` needs `--expires`**, the same rule as `declare --cmd`: a
+  predicate with no dated backstop can never auto-close. `expires` is the
+  lease rider from `schemas/lease.json`, written flat into the frontmatter.
+- **An existing slug is refused.** Two sessions independently inventing the
+  same path is the collision worktrees do not stop; edit the file instead.
+- **It reads back what it wrote.** Every value is parsed back through the same
+  frontmatter reader orient uses; anything YAML could misread (quotes, `: `)
+  goes in a folded block, wrapped so the join gives the exact string back.
+
+No ninth schema: a brief is markdown a person reads, and `schemas/README.md`
+caps the formats at eight until one earns its falsifier.
+
+## Sweep: the decay vent
+
+```sh
+python3 shed.py sweep                      # dry run: what has decayed, what is held
+python3 shed.py sweep --run-checks         # also run each open brief's done_check
+python3 shed.py sweep --apply              # flip the due ones to declined
+python3 shed.py sweep --flip <slug> --to open|consumed|superseded|declined [--note WHY]
+```
+
+Everything prospective decays unless someone engages with it. A brief is
+**due** when it has had no **body** edit in 30 days (`--idle-days`), or when
+its own `expires` has passed. The clock reads the body only: a frontmatter
+pass — a topic retrofit, a date pushed out — does not reset it (in the repo
+shed came from, bulk housekeeping touched 148 of 154 open briefs inside 29
+days, which kept nearly everything artificially fresh). It reads HEAD and
+`origin/main` both, so engagement pushed from another checkout counts, and a
+brief being edited right now (uncommitted) is never due. An untracked brief
+falls back to its file's mtime.
+
+- **Dry run unless `--apply`.** Apply flips status to `declined` and appends
+  a dated `expired-unclaimed` note that says **aged out, not judged**: when
+  eight stale-open briefs were checked by hand, four were finished work
+  nobody had flipped. It is reversible with `--flip <slug> --to open`.
+- **Two holds, never auto-flipped:** `global: true` (load-bearing; a quiet one
+  is a thing to read) and anything with a `done_check` (it may be `consumed`).
+- **`--run-checks` is explicit.** A sweep must not run shell commands out of
+  repo files as a side effect; with the flag it runs each `done_check` and
+  names the ones that hold as ready to flip — and flips nothing.
+- **The hooks never sweep.** Orient already hides what decayed; sweep makes the
+  files say so, and that is a person's (or a session's) call to make.
+
+## Proof: a number shows how it was read
+
+```sh
+python3 shed.py proof                      # origin/main..HEAD; rc 1 on an unbacked claim
+python3 shed.py proof --range A..B --tally # class counts, always rc 0
+python3 shed.py proof --message FILE       # one message — what the commit-msg hook calls
+python3 shed.py install --proof-hook       # opt-in: git itself refuses the commit
+```
+
+A commit message that asserts a **quantitative** result (`13/13`, `exit 0`,
+`ALL PASS`, `rc=0`, `42 passed`, `recall@k`) carries a proof block —
+`checked:` / `cmd:` / `evidence:` — or one auditable trailer:
+
+```
+Proof-Block: none (<why there is no block>)
+Proof-Block: <path#section>          the block lives in an artifact
+```
+
+**Form only.** It checks that a block was *shown*, never that the evidence is
+real or related, and the cheapest way past it is to delete the number —
+nothing measures that. `--tally` is the tripwire for the other failure: when
+declarations outnumber shown blocks, the gate is collecting opt-outs and
+measuring nothing. Merge commits are skipped (the branch commits carry the
+claim). The matchers are carried verbatim from the gate this was ported from,
+and over the same 200 commits the two produce identical class counts.
+
+`install --proof-hook` writes `commit-msg` into the clone's hooks directory
+(`core.hooksPath` when set). It is opt-in because `.git/hooks` is per clone
+and not shed's to touch unasked; it refuses to replace a hook it did not
+write (and prints the line to add); it fails open when `python3` is missing,
+because a gate that blocks every commit for want of an interpreter gets
+deleted.
 
 ## The handoff record
 
@@ -259,16 +361,18 @@ it stays a time window, and the record's `basis[git]` says so in words —
 
 ## What is deliberately not here
 
-Woosh, sweep, and proof — the other three verbs — are ports once the
-two-session test passes. Semantic recall, graphs, vector indexes, presence,
-Matrix: those are a *platform*, opt-in accelerators over these files, and
-they do not belong in the protocol. Signed records are next: whose handoff
+Re-running proof blocks to check the evidence is sound, a queue for
+judgment calls, and sweep signals that need a code forge or a model stay
+out: they are not file formats plus discipline. Semantic recall, graphs,
+vector indexes, presence, Matrix: those are a *platform*, opt-in
+accelerators over these files, and they do not belong in the protocol. Signed records are next: whose handoff
 it is becomes a question the moment a second party arrives.
 
 ## Verify
 
 ```sh
-python3 test_shed.py                      # 182 checks
-python3 shed.py orient --root /path/to/your/repo   # the page, ~0.2s
+python3 test_shed.py                      # ~280 checks
+python3 shed.py orient --root /path/to/your/repo   # the page, ~0.25s
+python3 shed.py sweep --root /path/to/your/repo    # dry run: what decayed, what is held
 python3 shed.py check record handoff/sessions/<ended>__<sid8>.json   # form check
 ```

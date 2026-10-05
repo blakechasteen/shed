@@ -581,6 +581,309 @@ with tempfile.TemporaryDirectory() as tmp:
     gb2 = next(b for b in d2["basis"] if b["instrument"] == "git")
     check("scope: on trunk the basis says ANY session in the window", "ANY session" in gb2.get("detail", ""), gb2)
 
+# ---------------------------------------------------------------- woosh / sweep / proof — the other three verbs
+
+def git_at(cwd, when, *a):
+    """git with both author and committer dates pinned: the body clock reads `--since`, which is committer time."""
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    if when:
+        env.update(GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
+    return subprocess.run(["git", "-C", cwd] + list(a), capture_output=True, text=True, env=env)
+
+
+def fm_of(path):
+    sys.path.insert(0, HERE)
+    import shed as shedmod
+    return shedmod.parse_frontmatter(open(path).read())[0]
+
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+NOW = _dt.now(_tz.utc)
+OLD = (NOW - _td(days=60)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+OLD_DAY = (NOW - _td(days=60)).date().isoformat()
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    bdir = os.path.join(tmp, "handoff", "brief")
+
+    # W1. woosh writes a brief that reads back exactly — awkward title and done_when included
+    title = 'Port the "parser": step two'
+    dw = "tests green under the new tokenizer — check: python3 -m pytest tests/test_parser.py -q; long-url https://example.com/" + "x" * 120 + " and well-known hyphen-words"
+    rc, out, err = sh(["woosh", "port-parser", title, "--done-when", dw, "--topic", "parser", "--sid8", "wsh00001"], tmp)
+    p = os.path.join(bdir, "port-parser.md")
+    check("woosh: writes handoff/brief/<slug>.md", rc == 0 and os.path.exists(p), out + err)
+    fm = fm_of(p) if os.path.exists(p) else {}
+    check("woosh: title round-trips through the frontmatter parser", fm.get("title") == title, fm.get("title"))
+    check("woosh: done_when round-trips (no split words, no hyphen breaks)", fm.get("done_when") == dw, fm.get("done_when"))
+    check("woosh: status open, created today, sid8 recorded",
+          fm.get("status") == "open" and fm.get("created") == NOW.date().isoformat() and fm.get("sid8") == "wsh00001", fm)
+    check("woosh: body opens with the suggestion line", "Suggestion, never directive" in open(p).read())
+    rc, out, _ = sh(["orient", "--root", tmp, "--max-lines", "0"], tmp)
+    check("woosh: orient lists the new brief", title[:40] in out, out)
+
+    # W2. refusals
+    rc, out, _ = sh(["woosh", "port-parser", "again", "--done-when", "x"], tmp)
+    check("woosh: refuses a slug that exists (namespace collision)", rc == 1 and "already exists" in out, out)
+    rc, out, _ = sh(["woosh", "Bad Slug", "t", "--done-when", "x"], tmp)
+    check("woosh: refuses a bad slug", rc == 2, out)
+    rc, out, _ = sh(["woosh", "_hidden", "t", "--done-when", "x"], tmp)
+    check("woosh: refuses a leading underscore (convention files)", rc == 2, out)
+    rc, out, _ = sh(["woosh", "armed", "t", "--done-when", "x", "--done-check", "true"], tmp)
+    check("woosh: --done-check without --expires refused", rc == 2 and "--expires" in out and not os.path.exists(os.path.join(bdir, "armed.md")), out)
+    rc, out, err = sh(["woosh", "nodw", "t"], tmp)
+    check("woosh: --done-when is required", rc == 2 and not os.path.exists(os.path.join(bdir, "nodw.md")), err)
+
+    # W3. armed + body from stdin; a shell command keeps its spacing
+    rc, out, _ = sh(["woosh", "armed", "Armed brief", "--done-when", "x", "--done-check", 'grep -q "a  b" f.txt', "--expires", "2099-01-01",
+                     "--body", "-"], tmp, stdin="## Why\n\nbecause.\n")
+    fm = fm_of(os.path.join(bdir, "armed.md"))
+    check("woosh: done_check keeps its exact spacing", fm.get("done_check") == 'grep -q "a  b" f.txt', fm.get("done_check"))
+    check("woosh: expires written as the lease rider", fm.get("expires") == "2099-01-01", fm)
+    check("woosh: --body - reads stdin", "because." in open(os.path.join(bdir, "armed.md")).read())
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    bdir = os.path.join(tmp, "handoff", "brief")
+    os.makedirs(bdir)
+
+    def brief(name, extra="", created=OLD_DAY, body="body text\n"):
+        with open(os.path.join(bdir, name + ".md"), "w") as f:
+            f.write("---\ntitle: {} brief\nstatus: open\ncreated: {}\n{}done_when: >\n  x\n---\n\n{}".format(name, created, extra, body))
+
+    # S1. five briefs committed 60 days ago: plain, global, armed, frontmatter-poked, body-edited
+    for n, extra in (("stale", ""), ("glob", "global: true\n"), ("chk", "done_check: true\nexpires: 2099-01-01\n"),
+                     ("poked", "topic: a\n"), ("edited", "")):
+        brief(n, extra)
+    brief("expd", "expires: 2020-01-01\n", created=NOW.date().isoformat())  # young, but past its own backstop
+    git_at(tmp, OLD, "add", "-A")
+    git_at(tmp, OLD, "commit", "-q", "-m", "briefs, long ago")
+    # today: a frontmatter-only pass on `poked` (must NOT reset the clock), a body edit on `edited` (must)
+    txt = open(os.path.join(bdir, "poked.md")).read().replace("topic: a", "topic: b")
+    open(os.path.join(bdir, "poked.md"), "w").write(txt)
+    open(os.path.join(bdir, "edited.md"), "a").write("a new paragraph of real engagement\n")
+    git_at(tmp, None, "commit", "-qam", "touch two briefs")
+    # an untracked brief whose file is old on disk: the filesystem is its only clock
+    brief("loose")
+    os.utime(os.path.join(bdir, "loose.md"), (time.time() - 60 * 86400,) * 2)
+
+    rc, out, _ = sh(["orient", "--root", tmp, "--max-lines", "0"], tmp)
+    check("clock: a body edit keeps a brief on the page", "edited brief" in out, out)
+    check("clock: a frontmatter-only edit does not", "poked brief" not in out, out)
+    check("clock: a brief past its own expires leaves the page", "expd brief" not in out, out)
+    check("clock: an old untracked file leaves the page", "loose brief" not in out, out)
+    check("clock: orient counts what decayed and names sweep", "decayed, not shown" in out and "shed.py sweep" in out, out)
+
+    before = {f: open(os.path.join(bdir, f)).read() for f in os.listdir(bdir)}
+    rc, out, _ = sh(["sweep", "--root", tmp], tmp)
+    check("sweep: dry run rc0 and writes nothing", rc == 0 and before == {f: open(os.path.join(bdir, f)).read() for f in os.listdir(bdir)}, out)
+    for n in ("stale", "poked", "loose", "expd"):
+        check("sweep: {} is due".format(n), "due   handoff/brief/{}.md".format(n) in out, out)
+    check("sweep: the expired one says why", "expires 2020-01-01 passed" in out, out)
+    check("sweep: global is held, not due", "held  handoff/brief/glob.md" in out and "[global" in out, out)
+    check("sweep: done_check is held, not due", "held  handoff/brief/chk.md" in out and "[done_check" in out, out)
+    check("sweep: the edited brief is live", "edited.md" not in out, out)
+    check("sweep: dry run does not run done_check", "check handoff" not in out, out)
+
+    rc, out, _ = sh(["sweep", "--root", tmp, "--run-checks"], tmp)
+    check("sweep --run-checks: a holding done_check is named ready", "check handoff/brief/chk.md  — MET" in out and "--flip chk --to consumed" in out, out)
+    check("sweep --run-checks: still flips nothing", fm_of(os.path.join(bdir, "chk.md")).get("status") == "open")
+
+    rc, out, _ = sh(["sweep", "--root", tmp, "--apply", "--sid8", "swp00001"], tmp)
+    check("sweep --apply: due briefs declined", rc == 0 and all(fm_of(os.path.join(bdir, n + ".md")).get("status") == "declined"
+                                                               for n in ("stale", "poked", "loose", "expd")), out)
+    st = open(os.path.join(bdir, "stale.md")).read()
+    check("sweep --apply: the note says aged out, not judged, and how to reverse",
+          "expired-unclaimed" in st and "AGED OUT, not judged" in st and "--flip stale --to open" in st and "sid8 swp00001" in st, st[-300:])
+    check("sweep --apply: the rest of the frontmatter survives", fm_of(os.path.join(bdir, "poked.md")).get("topic") == "b")
+    check("sweep --apply: held briefs untouched", all(fm_of(os.path.join(bdir, n + ".md")).get("status") == "open" for n in ("glob", "chk", "edited")))
+
+    rc, out, _ = sh(["sweep", "--root", tmp, "--flip", "stale", "--to", "open", "--note", "picking it up"], tmp)
+    check("sweep --flip: reverses a vent", rc == 0 and fm_of(os.path.join(bdir, "stale.md")).get("status") == "open", out)
+    rc, out, _ = sh(["sweep", "--root", tmp, "--apply"], tmp)
+    check("sweep: a reopened brief being edited (dirty) is not re-declined", fm_of(os.path.join(bdir, "stale.md")).get("status") == "open", out)
+    rc, out, _ = sh(["sweep", "--root", tmp, "--flip", "nosuch", "--to", "open"], tmp)
+    check("sweep --flip: unknown brief rc2", rc == 2, out)
+    rc, out, _ = sh(["sweep", "--root", tmp, "--flip", "stale"], tmp)
+    check("sweep --flip: needs --to", rc == 2, out)
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    base = git_at(tmp, None, "rev-parse", "HEAD").stdout.strip()
+    msgs = {
+        "blocked": "fix parser\n\n13/13 tests pass now.",
+        "with-block": "fix lexer\n\n3/3 pass.\n\nchecked: lexer\ncmd: python3 -m pytest -q\nevidence: 3 passed",
+        "exempt": "bump\n\n2/2 targets\n\nProof-Block: none (version bump, nothing measured)",
+        "pointer": "measure\n\n5 passed in the probe\n\nProof-Block: docs/probe.md#run",
+        "no-claim": "release notes for 2026-09-01",
+    }
+    sha = {}
+    for i, (k, m) in enumerate(msgs.items()):
+        open(os.path.join(tmp, "f{}.txt".format(i)), "w").write(k)
+        git_at(tmp, None, "add", "-A")
+        git_at(tmp, None, "commit", "-q", "-m", m)
+        sha[k] = git_at(tmp, None, "rev-parse", "HEAD").stdout.strip()
+
+    # P1. range mode
+    rc, out, _ = sh(["proof", "--root", tmp, "--range", base + "..HEAD"], tmp)
+    check("proof: rc1 when a commit claims a number with no block", rc == 1, out)
+    check("proof: names the blocked commit, what is missing, and the claim",
+          sha["blocked"][:12] in out and "missing checked:, cmd:, evidence:" in out and "13/13" in out, out)
+    check("proof: a block, an exemption, a pointer and a date all pass",
+          all(sha[k][:12] not in out for k in ("with-block", "exempt", "pointer", "no-claim")), out)
+    rc, out, _ = sh(["proof", "--root", tmp, "--range", sha["blocked"] + "..HEAD"], tmp)
+    check("proof: a clean range is rc0", rc == 0 and "none blocked" in out, out)
+    rc, out, _ = sh(["proof", "--root", tmp, "--range", base + "..HEAD", "--tally"], tmp)
+    check("proof --tally: always rc0 and counts each class",
+          rc == 0 and all("1 " + k in out for k in ("no-claim", "with-block", "exempt", "pointer", "blocked")), out)
+    check("proof --tally: declarations >= shown blocks trips the wire", "TRIPWIRE" in out, out)
+    rc, out, _ = sh(["proof", "--root", tmp, "--range", "HEAD..HEAD", "--tally"], tmp)
+    check("proof --tally: an empty range prints a control", rc == 0 and "CONTROL: HEAD=" in out, out)
+    rc, out, _ = sh(["proof", "--root", tmp, "--range", "nosuchref..HEAD"], tmp)
+    check("proof: an unreadable range is rc2, instrument silent", rc == 2 and "instrument silent" in out, out)
+
+    # P2. message mode (the commit-msg hook's $1): git's comment lines are not the message
+    mp = os.path.join(tmp, "MSG")
+    open(mp, "w").write("tidy\n\n# 13/13 in a comment git will strip\n# Please enter the commit message for your changes.\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("proof --message: a claim only in comments of an editor session passes", rc == 0, out)
+    open(mp, "w").write("tidy\n\nall 4/4 green\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("proof --message: an unbacked claim is rc1 with the fix spelled out", rc == 1 and "Proof-Block: none" in out, out)
+    open(mp, "w").write("tidy\n\nall 4/4 green\n\nProof-Block: none (\n  wrapped reason that runs\n  past the margin)\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("proof --message: an exemption whose reason wraps still counts", rc == 0, out)
+    open(mp, "w").write("docs\n\n4/4 sections; see `Proof-Block: none (<reason>)  -- the exemption form`\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("proof --message: prose quoting the trailer is not an exemption", rc == 1, out)
+
+    # P3. install --proof-hook: opt-in, enforced by git itself, idempotent, never clobbers
+    rc, out, _ = sh(["install", "--root", tmp], tmp)
+    hook = os.path.join(tmp, ".git", "hooks", "commit-msg")
+    check("install: no commit-msg hook unless asked", not os.path.exists(hook), out)
+    rc, out, _ = sh(["install", "--root", tmp, "--proof-hook"], tmp)
+    check("install --proof-hook: writes an executable commit-msg hook", os.access(hook, os.X_OK) and "commit-msg hook" in out, out)
+    open(os.path.join(tmp, "g.txt"), "w").write("g")
+    git_at(tmp, None, "add", "g.txt")
+    r = git_at(tmp, None, "commit", "-q", "-m", "speedup\n\n12/12 benchmarks faster")
+    check("proof hook: git refuses an unbacked quantitative commit", r.returncode != 0 and "proof block" in (r.stdout + r.stderr), r.stdout + r.stderr)
+    r = git_at(tmp, None, "commit", "-q", "-m", "speedup\n\n12/12 benchmarks faster\n\nProof-Block: none (illustrative)")
+    check("proof hook: git accepts it with a trailer", r.returncode == 0, r.stdout + r.stderr)
+    rc, out, _ = sh(["install", "--root", tmp, "--proof-hook"], tmp)
+    check("install --proof-hook: idempotent", "already installed" in out, out)
+    open(hook, "w").write("#!/bin/sh\nexit 0\n")
+    rc, out, _ = sh(["install", "--root", tmp, "--proof-hook"], tmp)
+    check("install --proof-hook: leaves a foreign hook alone and says what to add",
+          open(hook).read() == "#!/bin/sh\nexit 0\n" and "not shed's" in out and "proof --message" in out, out)
+
+
+# ---------------------------------------------------------------- adversarial pass 2026-10-04: each finding, reproduced then pinned
+
+def sh_env(args, cwd, env_extra, stdin=None):
+    r = subprocess.run([PY, SHED] + args, cwd=cwd, capture_output=True, text=True, input=stdin, env=dict(os.environ, **env_extra))
+    return r.returncode, r.stdout, r.stderr
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    bdir = os.path.join(tmp, "handoff", "brief")
+    os.makedirs(bdir)
+    names = ("update", "bullet", "plain", "dirty brief", "café", "fmonly")
+    for n in names:
+        with open(os.path.join(bdir, n + ".md"), "w", encoding="utf-8") as f:
+            f.write("---\ntitle: {} brief\nstatus: open\ncreated: {}\ntopic: a\ndone_when: >\n  x\n---\n\n# h\n\n- item a\n".format(n, OLD_DAY))
+    git_at(tmp, OLD, "add", "-A")
+    git_at(tmp, OLD, "commit", "-q", "-m", "old briefs")
+    for n, add in (("update", "Update: picked up, half built\n"), ("bullet", "  - detail b: built today\n"),
+                   ("plain", "real prose\n"), ("café", "real prose\n")):
+        open(os.path.join(bdir, n + ".md"), "a", encoding="utf-8").write(add)
+    t = open(os.path.join(bdir, "fmonly.md")).read().replace("topic: a", "topic: b")
+    open(os.path.join(bdir, "fmonly.md"), "w").write(t)
+    git_at(tmp, None, "commit", "-qam", "engage")
+    open(os.path.join(bdir, "dirty brief.md"), "a").write("editing right now\n")
+    rc, out, _ = sh(["sweep", "--root", tmp], tmp)
+    check("review#1: a body line shaped like YAML (`Update: …`) is engagement", "update.md" not in out, out)
+    check("review#1: an indented sub-bullet is engagement", "bullet.md" not in out, out)
+    check("review#1: control — a frontmatter-only commit still does not reset the clock", "due   handoff/brief/fmonly.md" in out, out)
+    check("review#2: a dirty brief whose name has a space is not due", "dirty brief.md" not in out, out)
+    check("review#2: a non-ASCII name's body edit is read from the log", "café.md" not in out, out)
+
+    # 3 + 4: flip edits only the top-level status line, keeps CRLF and the blank line after the fence
+    p = os.path.join(bdir, "folded.md")
+    open(p, "w", newline="").write("---\r\ntitle: Folded\r\ndone_when: >\r\n  the release is out and\r\n  status: green on the board\r\nstatus: open\r\n---\r\n\r\nbody\r\n")
+    rc, out, _ = sh(["sweep", "--root", tmp, "--flip", "folded", "--to", "consumed"], tmp)
+    raw = open(p, newline="").read()
+    fm = fm_of(p)
+    check("review#3: an indented `status:` inside a folded block is left alone",
+          rc == 0 and fm.get("status") == "consumed" and fm.get("done_when") == "the release is out and status: green on the board", (out, fm))
+    check("review#4: CRLF survives a flip", raw.count("\r\n") == raw.count("\n") and raw.count("\r\n") > 8, repr(raw))
+    check("review#4: the blank line after the fence survives a flip", "---\r\n\r\nbody" in raw, repr(raw))
+    p2 = os.path.join(bdir, "nostatus.md")
+    open(p2, "w").write("---\ntitle: No status line\ndone_when: >\n  a\n  status: green\n---\n\nbody\n")
+    rc, out, _ = sh(["sweep", "--root", tmp, "--flip", "nostatus", "--to", "declined"], tmp)
+    fm = fm_of(p2)
+    check("review#3: with no top-level status, one is added and done_when is intact",
+          rc == 0 and fm.get("status") == "declined" and fm.get("done_when") == "a status: green", (out, fm))
+
+    # 5: a line break of any kind in --done-check is refused before a file exists
+    for i, cmd in enumerate(("test -f a\r; rm -rf nothing", "test -f a\x0c; true")):
+        rc, out, _ = sh(["woosh", "brk{}".format(i), "t", "--done-when", "x", "--done-check", cmd, "--expires", "2099-01-01"], tmp)
+        check("review#5: --done-check with a line break ({!r}) refused, no file".format(cmd[9:10]),
+              rc == 2 and not os.path.exists(os.path.join(bdir, "brk{}.md".format(i))), out)
+
+    # 6: scalars YAML would retype are quoted; shed's reader still gives the string back
+    for i, title in enumerate(("true", "null", "~", "1.0", "2026-10-04")):
+        rc, out, _ = sh(["woosh", "yaml{}".format(i), title, "--done-when", "x"], tmp)
+        pth = os.path.join(bdir, "yaml{}.md".format(i))
+        check("review#6: title {!r} is quoted for YAML and reads back".format(title),
+              rc == 0 and 'title: "{}"\n'.format(title) in open(pth).read() and fm_of(pth).get("title") == title, out)
+
+    # 7 + 8: the hook judges the message git will store
+    mp = os.path.join(tmp, "MSG")
+    open(mp, "w").write("Fix flaky retry\n\n#41: 12/12 runs green\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("review#7: without git's editor template a `#` line is kept, as `-m` keeps it", rc == 1 and "#41" in out, out)
+    open(mp, "w").write("Fix flaky retry\n\n#41: 12/12 runs green\n# Please enter the commit message for your changes. Lines starting\n# with '#' will be ignored.\n")
+    rc, out, _ = sh(["proof", "--message", mp], tmp)
+    check("review#7: with the editor template, comment lines go as git strips them", rc == 0, out)
+    git_at(tmp, None, "config", "core.commentChar", ";")
+    open(mp, "w").write("notes: reword\n\n; ------------------------ >8 ------------------------\n; Do not modify or remove the line above.\n+latency budget is 3/4 of target\n")
+    rc, out, _ = sh(["proof", "--root", tmp, "--message", mp], tmp)
+    check("review#8: the scissors line honours core.commentChar — the diff below it is not the message", rc == 0, out)
+    git_at(tmp, None, "config", "--unset", "core.commentChar")
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    home = os.path.join(tmp, "home")
+    os.makedirs(home)
+    # 9: core.hooksPath with `~` — the hook lands where git will run it, and git runs it
+    git_at(tmp, None, "config", "core.hooksPath", "~/myhooks")
+    rc, out, _ = sh_env(["install", "--root", tmp, "--proof-hook"], tmp, {"HOME": home})
+    check("review#9: `~` in core.hooksPath is expanded the way git expands it",
+          os.path.exists(os.path.join(home, "myhooks", "commit-msg")) and not os.path.exists(os.path.join(tmp, "~")), out)
+    open(os.path.join(tmp, "b.txt"), "w").write("b")
+    git_at(tmp, None, "add", "b.txt")
+    r = subprocess.run(["git", "-C", tmp, "commit", "-q", "-m", "perf\n\n9/10 benchmarks faster"], capture_output=True, text=True,
+                       env=dict(os.environ, HOME=home, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+    check("review#9: and git actually runs it", r.returncode != 0 and "proof block" in r.stdout + r.stderr, r.stdout + r.stderr)
+    git_at(tmp, None, "config", "--unset", "core.hooksPath")
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    # 10: the hook fails OPEN when shed.py is not there (a checkout of a branch from before it existed)
+    copy = os.path.join(tmp, "elsewhere", "shed.py")
+    os.makedirs(os.path.dirname(copy))
+    import shutil
+    shutil.copy(SHED, copy)
+    shutil.copytree(os.path.join(HERE, "schemas"), os.path.join(tmp, "elsewhere", "schemas"))
+    r = subprocess.run([PY, copy, "install", "--root", tmp, "--proof-hook"], capture_output=True, text=True)
+    shutil.rmtree(os.path.join(tmp, "elsewhere"))
+    open(os.path.join(tmp, "c.txt"), "w").write("c")
+    git_at(tmp, None, "add", "c.txt")
+    r = git_at(tmp, None, "commit", "-q", "-m", "docs: reword the readme")
+    check("review#10: a missing shed.py lets the commit through and says why",
+          r.returncode == 0 and "not in this checkout" in r.stderr, (r.returncode, r.stdout, r.stderr))
+
+
 # ---------------------------------------------------------------- draft seat (fake endpoint, in-process)
 import http.server
 import socket
