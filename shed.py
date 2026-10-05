@@ -362,8 +362,9 @@ def zsplit(out):
 
 
 def body_clock(root, days=DECAY_DAYS):
-    """(edited, tracked, dirty): sets of REAL brief paths with a BODY-changing commit inside
-    `days`, under version control, and uncommitted right now. Real, not normalized: git names the
+    """(edited, tracked, dirty): `edited` maps each REAL brief path to the UTC date of its newest
+    BODY-changing commit (the scan reaches a little past `days`; brief_age judges by the date), and
+    `tracked`/`dirty` are the paths under version control and uncommitted right now. Real, not normalized: git names the
     toplevel by its resolved path (macOS /private/var/…) while the glob keeps the caller's
     (/var/…), and a path compared across the two never matches — every edit reads as silence. One `git log -p` for the directory,
     over HEAD and trunk both — a checkout can lag trunk, and engagement pushed from elsewhere must
@@ -373,18 +374,20 @@ def body_clock(root, days=DECAY_DAYS):
     trunk = trunk_ref(root)
     revs = ["HEAD"] + ([trunk] if trunk else [])
     # quotePath off: a non-ASCII name is otherwise octal-escaped in quotes and never matches its file
-    log = git(root, "-c", "core.quotePath=false", "log", *revs, "--since={}.days.ago".format(days),
-              "--format=@%H", "-p", "--unified=0", "--", bdir)
-    edited, fences = set(), {}
-    cur, lines, max_line = None, [], 0
+    # +2: `--since` is a rolling instant and the verdict is whole UTC days — the margin keeps every
+    # commit on the boundary date in the scan; anything older that slips in is judged by its date
+    log = git(root, "-c", "core.quotePath=false", "log", *revs, "--since={}.days.ago".format(days + 2),
+              "--format=@%H %ct", "-p", "--unified=0", "--", bdir)
+    edited, fences = {}, {}
+    cur, lines, max_line, day = None, [], 0, None
 
     def flush():
-        if cur:
+        if cur and day:
             if cur not in fences:
                 fences[cur] = fence_line(cur)
             real = [l for l in lines if l[1:].strip() not in ("", "---")]
             if not (real and all(FM_DIFF_LINE.match(l) for l in real) and max_line <= fences[cur]):
-                edited.add(cur)
+                edited[cur] = max(edited.get(cur, day), day)
 
     for line in (log or "").splitlines() if top else ():
         if line.startswith("@@"):
@@ -397,6 +400,10 @@ def body_clock(root, days=DECAY_DAYS):
         elif line.startswith("@") and not line.startswith("@@"):
             flush()
             cur, lines, max_line = None, [], 0
+            try:  # committer time, the clock `--since` reads; its DATE taken in UTC, as `created:` is written
+                day = datetime.fromtimestamp(int(line.split()[1]), timezone.utc).date()
+            except (IndexError, ValueError):
+                day = None  # unreadable stamp: the commit cannot vouch for engagement on any date
         elif line.startswith("+++ "):
             flush()
             p = line[4:].strip()
@@ -422,23 +429,32 @@ def body_clock(root, days=DECAY_DAYS):
 
 
 def brief_age(path, fm, clock, now, days=DECAY_DAYS):
-    """None when the brief is live — created, body-edited, or being edited (dirty) inside `days` —
-    else a short reason it is not. An untracked brief, or one in a repo with no history, falls back
-    to the filesystem clock: the only one there is."""
+    """None when the brief is live — being edited (dirty), or created or body-edited fewer than
+    `days` whole UTC days ago — else a short reason it is not. Whole UTC days because that is the
+    calendar `created:` and `expires:` are written in (woosh stamps utcnow().date()): a rolling
+    30x24h window flips a verdict mid-day, and local dates read a `created: 09-05` stamped at 21:53
+    EDT as a day younger than its commit — sweep and brief_sweep disagreed on three briefs a day
+    that way (2026-10-05). An untracked brief, or one in a repo with no history, falls back to the
+    filesystem clock: the only one there is."""
     edited, tracked, dirty = clock
     p = os.path.realpath(path)
-    created = parse_iso((fm.get("created") or "")[:10])
-    if created and now - created <= timedelta(days=days):
-        return None
     if p in dirty:
         return None
+    created = parse_iso((fm.get("created") or "")[:10])
+    marks = [created.date()] if created else []
     if p in tracked:
-        return None if p in edited else "no body edit in {}d".format(days)
-    try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
-    except OSError:
-        return "unreadable"
-    return None if now - mtime <= timedelta(days=days) else "untouched on disk {}d".format((now - mtime).days)
+        marks += [edited[p]] if p in edited else []
+        why = "no body edit in {}d".format(days)
+    else:
+        try:
+            marks.append(datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).date())
+        except OSError:
+            return "unreadable"
+        why = "untouched on disk {}d"
+    if not marks:
+        return why
+    idle = (now.astimezone(timezone.utc).date() - max(marks)).days
+    return None if idle < days else why.format(idle)
 
 
 def brief_expired(fm, now):

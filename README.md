@@ -170,7 +170,9 @@ shed came from, bulk housekeeping touched 148 of 154 open briefs inside 29
 days, which kept nearly everything artificially fresh). It reads HEAD and
 `origin/main` both, so engagement pushed from another checkout counts, and a
 brief being edited right now (uncommitted) is never due. An untracked brief
-falls back to its file's mtime.
+falls back to its file's mtime. Days are whole **UTC** dates — the calendar
+`created:` is written in — so a brief turns due at 00:00Z and stays due all
+day, on any machine, whatever its local zone.
 
 - **Dry run unless `--apply`.** Apply flips status to `declined` and appends
   a dated `expired-unclaimed` note that says **aged out, not judged**: when

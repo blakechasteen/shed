@@ -933,6 +933,46 @@ def free_port():
     return port
 
 
+# ---------------------------------------------------------------- the decay calendar: whole UTC days
+# 2026-10-05: sweep and hololoom_mcp's brief_sweep disagreed on three briefs, because shed counted a rolling
+# 30x24h window and brief_sweep local dates, against a `created:` written as a UTC date. Both now count whole
+# UTC days; these fail on the commit before.
+
+with tempfile.TemporaryDirectory() as tmp:
+    fresh_repo(tmp)
+    sys.path.insert(0, HERE)
+    import shed as shedmod
+    bdir = os.path.join(tmp, "handoff", "brief")
+    os.makedirs(bdir)
+    p = os.path.join(bdir, "late.md")
+    with open(p, "w") as f:
+        f.write("---\ntitle: late\nstatus: open\ncreated: 2020-01-01\ndone_when: >\n  x\n---\n\nbody\n")
+    local_day = (NOW - _td(days=3)).date()
+    git_at(tmp, None, "add", "-A")
+    git_at(tmp, "{}T23:44:31-04:00".format(local_day), "commit", "-q", "-m", "late-evening edit, EDT")
+    edited, tracked, _ = shedmod.body_clock(tmp)
+    check("calendar: a 23:44 EDT commit is dated by its UTC day, not the committer's",
+          edited.get(os.path.realpath(p)) == local_day + _td(days=1), edited)
+
+    def at(y, mo, d, h, mi):
+        return _dt(y, mo, d, h, mi, tzinfo=_tz.utc)
+
+    q = os.path.realpath(os.path.join(bdir, "convener.md"))
+    fm = {"created": "2026-09-05"}  # stamped from a 21:53 EDT commit on 09-04, i.e. 01:53Z on 09-05
+    clock = ({q: at(2026, 9, 5, 1, 53).date()}, {q}, set())
+    check("calendar: 29 whole UTC days after created + last edit is live",
+          shedmod.brief_age(q, fm, clock, at(2026, 10, 4, 23, 59)) is None)
+    check("calendar: 30 whole UTC days is due from the first minute of the day — not 01:53Z",
+          shedmod.brief_age(q, fm, clock, at(2026, 10, 5, 0, 1)) == "no body edit in 30d")
+    check("calendar: the verdict holds all day (no mid-day flip)",
+          shedmod.brief_age(q, fm, clock, at(2026, 10, 5, 23, 59)) == "no body edit in 30d")
+    r = os.path.realpath(os.path.join(bdir, "weft.md"))  # body edit 23:44 EDT on 09-04 = 03:44Z on 09-05
+    clock = ({r: at(2026, 9, 5, 3, 44).date()}, {r}, set())
+    check("calendar: an edit 30 UTC days back is due even while the rolling window still covered it",
+          shedmod.brief_age(r, {"created": "2026-09-04"}, clock, at(2026, 10, 5, 1, 55)) == "no body edit in 30d")
+    check("calendar: a dirty brief stays live whatever its age",
+          shedmod.brief_age(r, {"created": "2020-01-01"}, ({}, {r}, {r}), at(2026, 10, 5, 1, 55)) is None)
+
 try:
     srv = http.server.HTTPServer(("127.0.0.1", 0), FakeSeat)
 except OSError as e:
